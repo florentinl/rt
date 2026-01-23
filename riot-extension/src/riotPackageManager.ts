@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { Package, PackageManager, PackageManagementOptions, PythonEnvironment } from './api';
-import { RiotEnvManager, buildManagerId } from './riotEnvManager';
+import { RiotEnvManager } from './riotEnvManager';
+import { buildManagerId } from './types/rtTypes';
 
 export class RiotPackageManager implements PackageManager {
     name = 'rt';
@@ -37,15 +38,8 @@ export class RiotPackageManager implements PackageManager {
     async getPackages(environment: PythonEnvironment): Promise<Package[] | undefined> {
         try {
             const venvHash = environment.envId.id;
-            const scope = this.workspaceUriForEnv(environment);
-            const envs = await this.envManager.getEnvironments(scope ?? environment.environmentPath);
-            const match = envs.find((env) => env.envId.id === venvHash);
-            if (!match) {
-                return [];
-            }
-
-            const cwd = scope?.fsPath ?? environment.environmentPath.fsPath;
-            const venv = await this.envManager.fetchVenvByHash(venvHash, cwd);
+            const cwd = environment.environmentPath.fsPath;
+            const venv = await this.envManager.getVenvByHash(venvHash, cwd);
             if (!venv) {
                 return [];
             }
@@ -65,10 +59,6 @@ export class RiotPackageManager implements PackageManager {
             this.log?.appendLine(`[riot] Failed to list packages: ${msg}`);
             return [];
         }
-    }
-
-    private workspaceUriForEnv(environment: PythonEnvironment): vscode.Uri | undefined {
-        return this.envManager.workspaceUriForEnvironment(environment);
     }
 
     clearCache?(): Promise<void> {

@@ -35,7 +35,7 @@
     ]
   },
   "scripts": {
-    "dist": "npm run package && vsce package",
+    "dist": "rm -rf python && ./build-runtime.sh && npm run package && vsce package",
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
     "watch": "npm-run-all -p watch:*",

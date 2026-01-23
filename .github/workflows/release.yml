@@ -33,9 +33,6 @@ jobs:
           cache: npm
           cache-dependency-path: riot-extension/package-lock.json
 
-      - name: Build bundled runtime
-        run: bash scripts/build-runtime.sh
-
       - name: Install dependencies
         working-directory: riot-extension
         run: npm ci
