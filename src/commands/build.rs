@@ -13,8 +13,8 @@ use crate::{
     command::ManagedCommand,
     config::Selector,
     progress::{
-        summarize_errors, MultiplexedProgressLogger, ProgressLogger, StepContext, StepGuard,
-        StepId, StepOutcome, Task, TaskRunner,
+        summarize_errors, MultiplexedProgressLogger, ProgressLogger, StepContext, StepId,
+        StepOutcome, Task, TaskRunner,
     },
     venv::{venv_path, ExecutionContext, RiotVenv},
 };
@@ -75,7 +75,6 @@ pub fn build_selected_contexts(
         Arc::clone(&repo.run_env),
         repo.riot_root.clone(),
         repo.pytest_plugin_dir.clone(),
-        Arc::clone(&sink),
     ));
     let runner = TaskRunner::new(Arc::clone(&sink)).with_parallelism(Some(current_num_threads()));
 
@@ -148,7 +147,6 @@ type DynError = Box<dyn Error + Send + Sync>;
 type DynResult<T> = Result<T, DynError>;
 
 pub struct BuildSharedState {
-    sink: Arc<dyn ProgressLogger>,
     force_reinstall: bool,
     build_env: Arc<HashMap<String, String>>,
     run_env: Arc<HashMap<String, String>>,
@@ -163,10 +161,8 @@ impl BuildSharedState {
         run_env: Arc<HashMap<String, String>>,
         riot_root: PathBuf,
         pytest_plugin_dir: Option<PathBuf>,
-        sink: Arc<dyn ProgressLogger>,
     ) -> Self {
         Self {
-            sink,
             force_reinstall,
             build_env,
             run_env,
@@ -212,69 +208,32 @@ impl BuildSharedState {
         Ok(StepOutcome::Done)
     }
 
-    fn ensure_requirements_file(&self, venv: &RiotVenv) -> DynResult<PathBuf> {
-        let mut requirements_dir = self.riot_root.clone();
-        requirements_dir.push(REQUIREMENTS_DIR);
-        fs::create_dir_all(&requirements_dir)?;
+    fn get_requirements_file(&self, venv: &RiotVenv) -> DynResult<NamedTempFile> {
+        let requirements_txt = self
+            .riot_root
+            .join(REQUIREMENTS_DIR)
+            .join(format!("{}.txt", venv.hash));
 
-        let requirements_txt = requirements_dir.join(format!("{}.txt", venv.hash));
-        let step_id = format!("req_{}", venv.hash);
-        let step_description = format!("Compile requirements ({} packages)", venv.pkgs.len());
-
-        if requirements_txt.exists() {
-            return Ok(requirements_txt);
-        }
-
-        let compile_step = StepId::new(step_id);
-        self.sink.register_step(&compile_step, &step_description);
-        self.sink.start(&compile_step);
-        let guard = StepGuard::new(Arc::clone(&self.sink), compile_step.clone());
-
-        let deps = format_requirements(&venv.pkgs);
-        let mut requirements_in_file = Builder::new()
-            .prefix(&format!("{}_", venv.hash))
-            .suffix(".in")
-            .tempfile_in(&requirements_dir)?;
-        if deps.trim().is_empty() {
-            writeln!(
-                requirements_in_file,
-                "# Base requirements for {} are empty; file generated for uv.",
-                venv.hash
-            )?;
+        let requirements = if requirements_txt.exists() {
+            fs::read_to_string(requirements_txt)?
         } else {
-            requirements_in_file.write_all(deps.as_bytes())?;
+            format_requirements(&venv.pkgs)
         }
-        requirements_in_file.flush()?;
-        let requirements_in_path = requirements_in_file.path().to_path_buf();
-        let _requirements_in_guard = requirements_in_file.into_temp_path();
+        .replace("/home/bits/project", ".");
 
-        let status = ManagedCommand::new_uv("pip", Arc::clone(&self.sink), compile_step)
-            .envs(self.build_env.as_ref())
-            .arg("compile")
-            .arg("--system")
-            .arg("--python")
-            .arg(&venv.python)
-            .arg(&requirements_in_path)
-            .arg("--output-file")
-            .arg(&requirements_txt)
-            .status()?;
+        let mut temp = Builder::new().suffix(".txt").tempfile()?;
+        temp.write_all(requirements.as_bytes())?;
+        temp.flush()?;
 
-        if !status.success() {
-            return Err(Box::new(io::Error::other(format!(
-                "uv pip compile failed with status {status}"
-            ))));
-        }
-
-        guard.done();
-
-        Ok(requirements_txt)
+        Ok(temp)
     }
 
     fn ensure_deps_install(&self, venv: &RiotVenv, ctx: &StepContext) -> DynResult<StepOutcome> {
-        let requirements_path = self.ensure_requirements_file(venv)?;
         let mut deps_install_path = self.riot_root.clone();
         deps_install_path.push(VENV_DEPS_DIR);
         deps_install_path.push(format!("deps_{}", venv.hash));
+
+        let requirements_file = self.get_requirements_file(venv)?;
 
         let marker_path = deps_install_path.join(DONE_MARKER);
         if !self.force_reinstall && marker_path.is_file() {
@@ -286,9 +245,6 @@ impl BuildSharedState {
         }
         fs::create_dir_all(&deps_install_path)?;
 
-        let (requirements_for_install, temp_guard) =
-            rewrite_requirements_for_install(&requirements_path, &venv.hash)?;
-
         let status = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
             .envs(self.build_env.as_ref())
             .arg("install")
@@ -298,10 +254,8 @@ impl BuildSharedState {
             .arg("--target")
             .arg(&deps_install_path)
             .arg("--requirement")
-            .arg(&requirements_for_install)
+            .arg(&requirements_file.path())
             .status()?;
-
-        drop(temp_guard);
 
         if !status.success() {
             return Err(Box::new(io::Error::other(format!(
@@ -487,31 +441,6 @@ fn get_deps_install_path(riot_root: &Path, hash: &str) -> PathBuf {
     deps_install_path.push(VENV_DEPS_DIR);
     deps_install_path.push(format!("deps_{hash}"));
     deps_install_path
-}
-
-/// Prepare requirements file for install by replacing absolute project paths.
-fn rewrite_requirements_for_install(
-    requirements_path: &Path,
-    venv_hash: &str,
-) -> io::Result<(PathBuf, Option<NamedTempFile>)> {
-    let contents = fs::read_to_string(requirements_path)?;
-    let replaced = contents.replace("/home/bits/project", ".");
-
-    if replaced == contents {
-        return Ok((requirements_path.to_path_buf(), None));
-    }
-
-    let parent = requirements_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let mut temp = Builder::new()
-        .prefix(&format!("{venv_hash}_rewrite_"))
-        .suffix(".txt")
-        .tempfile_in(parent)?;
-    temp.write_all(replaced.as_bytes())?;
-    temp.flush()?;
-
-    Ok((temp.path().to_path_buf(), Some(temp)))
 }
 
 fn python_string_literal<S: AsRef<OsStr>>(value: S) -> String {
