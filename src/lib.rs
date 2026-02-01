@@ -324,9 +324,7 @@ fn locate_pytest_plugin_dir(py: Python<'_>) -> Option<PathBuf> {
     let module = py.import(crate::constants::PYTEST_PLUGIN_MODULE).ok()?;
     let file_attr = module.getattr("__file__").ok()?;
     let file_path: PathBuf = file_attr.extract().ok()?;
-    let parent = file_path.parent()?;
-    let plugin_path = parent.join("rt.py");
-    (parent.is_dir() && plugin_path.is_file()).then(|| parent.to_path_buf())
+    Some(file_path.parent()?.to_path_buf())
 }
 
 /// Entry point used by the Python console-script proxy.
@@ -378,14 +376,12 @@ fn run_cli(py: Python<'_>) -> PyResult<()> {
     };
 
     let pytest_plugin_dir = locate_pytest_plugin_dir(py);
-    if pytest_plugin_dir.is_none() {
-        eprintln!(
-            "warning: rt pytest plugin could not be located; pytest integration may be disabled."
-        );
-    }
+    let Some(pytest_plugin_dir) = pytest_plugin_dir else {
+        eprintln!("error: rt pytest plugin could not be located; aborting.");
+        return Err(PyErr::new::<PySystemExit, _>(1));
+    };
 
-    let mut repo_config = RepoConfig::load(&riotfile_path, &riot_root)?;
-    repo_config.pytest_plugin_dir = pytest_plugin_dir;
+    let repo_config = RepoConfig::load(riotfile_path, riot_root, pytest_plugin_dir)?;
 
     run_command(py, cli, &repo_config)
 }

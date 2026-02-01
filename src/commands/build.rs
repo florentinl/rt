@@ -1,10 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    ffi::OsStr,
-    fmt::Write as FmtWrite,
     fs::{self, File},
-    io::{self, BufWriter, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -19,6 +17,7 @@ use crate::{
     venv::{venv_path, ExecutionContext, RiotVenv},
 };
 use indexmap::IndexMap;
+use itertools::Itertools;
 use tempfile::{Builder, NamedTempFile};
 
 use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
@@ -151,7 +150,7 @@ pub struct BuildSharedState {
     build_env: Arc<HashMap<String, String>>,
     run_env: Arc<HashMap<String, String>>,
     riot_root: PathBuf,
-    pytest_plugin_dir: Option<PathBuf>,
+    pytest_plugin_dir: PathBuf,
 }
 
 impl BuildSharedState {
@@ -160,7 +159,7 @@ impl BuildSharedState {
         build_env: Arc<HashMap<String, String>>,
         run_env: Arc<HashMap<String, String>>,
         riot_root: PathBuf,
-        pytest_plugin_dir: Option<PathBuf>,
+        pytest_plugin_dir: PathBuf,
     ) -> Self {
         Self {
             force_reinstall,
@@ -194,7 +193,7 @@ impl BuildSharedState {
             .arg("--target")
             .arg(&dev_install_path)
             .args(["-e", "."])
-            // .args(["--config-setting", "editable_mode=compat"])
+            .args(["--config-setting", "editable_mode=compat"])
             .status()?;
 
         if !status.success() {
@@ -305,7 +304,7 @@ impl BuildSharedState {
 
         let site_packages_path =
             exc_venv_path.join(format!("lib/python{}/site-packages", &venv.python));
-        self.write_sitecustomize(
+        self.configure_site_packages(
             exc,
             &deps_install_path,
             dev_install_path.as_ref(),
@@ -324,7 +323,7 @@ impl BuildSharedState {
         Ok(StepOutcome::Done)
     }
 
-    fn write_sitecustomize(
+    fn configure_site_packages(
         &self,
         exc: &ExecutionContext,
         deps_install_path: &Path,
@@ -332,98 +331,73 @@ impl BuildSharedState {
         site_packages_path: &Path,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         fs::create_dir_all(site_packages_path)?;
-        let sitecustomize_path = site_packages_path.join("sitecustomize.py");
-        let sitecustomize_file = File::create(sitecustomize_path)?;
-        let mut sitecustomize = BufWriter::new(sitecustomize_file);
-        {
-            if let Some(dev_install_path) = dev_install_path {
-                let dev_install_pth_path = site_packages_path.join("self-deps.pth");
-                let current_dir = self.riot_root.parent().ok_or_else(|| {
-                    eprintln!("error: could not find riot root parent");
-                    return PyErr::new::<PySystemExit, _>(1);
-                })?;
-                fs::write(
-                    &dev_install_pth_path,
-                    format!(
-                        "{}\n{}\n",
-                        dev_install_path.to_string_lossy(),
-                        current_dir.to_string_lossy()
-                    ),
-                )?;
 
-                for entry in fs::read_dir(dev_install_path)? {
-                    let entry = entry?;
-                    let file_name = entry.file_name();
-                    if !file_name
-                        .to_str()
-                        .map(|name| name.starts_with("__editable__"))
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if entry.file_type()?.is_file() {
-                        fs::copy(entry.path(), site_packages_path.join(file_name))?;
-                    }
+        let current_dir = self.riot_root.parent().ok_or_else(|| {
+            eprintln!("error: could not find riot root parent");
+            return PyErr::new::<PySystemExit, _>(1);
+        })?;
+
+        let mut paths = vec![];
+        if let Some(dev_install_path) = dev_install_path {
+            paths.push((current_dir.to_string_lossy(), "current project"));
+            paths.push((
+                dev_install_path.to_string_lossy(),
+                "current project dependencies",
+            ));
+        }
+        paths.push((deps_install_path.to_string_lossy(), "riot dependencies"));
+        paths.push((
+            self.pytest_plugin_dir.to_string_lossy(),
+            "pytest plugin injected by rt",
+        ));
+
+        {
+            // pth file is necessary for analysis tools that do not execute sitecustomize.py
+            let pth_file = site_packages_path.join("riot.pth");
+            let pth_content = paths
+                .iter()
+                .map(|(path, comment)| format!("# {}\n{}", comment, path))
+                .join("\n");
+            fs::write(pth_file, pth_content)?;
+        }
+
+        {
+            let sitecustomize_path = site_packages_path.join("sitecustomize.py");
+            let mut sitecustomize_content = String::new();
+            sitecustomize_content.push_str("import site, os\n");
+
+            // adding paths in sitecustomize is necessary to include transitive .pth files
+            for (path, comment) in paths {
+                sitecustomize_content
+                    .push_str(&format!("site.addsitedir(r\"{}\") # {}\n", path, comment));
+            }
+
+            // environment variables from riotfile.py
+            if !exc.env.is_empty() {
+                sitecustomize_content.push_str("\n# Environment variables from riotfile.py\n");
+                for (key, val) in &exc.env {
+                    sitecustomize_content
+                        .push_str(&format!("os.environ[r\"{}\"] = r\"{}\"\n", key, val));
                 }
             }
-        }
-        {
-            let deps_pth_path = site_packages_path.join("riot-deps.pth");
-            fs::write(
-                &deps_pth_path,
-                format!("{}\n", deps_install_path.to_string_lossy()),
-            )?;
-        }
-        {
-            writeln!(sitecustomize, "# Environment variables from riotfile.py")?;
-            writeln!(sitecustomize, "import os")?;
-            for (key, val) in &exc.env {
-                writeln!(
-                    sitecustomize,
-                    "os.environ[{}] = {}",
-                    python_string_literal(key),
-                    python_string_literal(val)
-                )?;
+
+            // environment variables from rt.toml
+            if !self.run_env.is_empty() {
+                sitecustomize_content.push_str("\n# Environment variables from rt.toml\n");
+                for (key, val) in self.run_env.iter() {
+                    sitecustomize_content
+                        .push_str(&format!("os.environ[r\"{}\"] = r\"{}\"\n", key, val));
+                }
             }
+
+            // enable pytest rt
+            sitecustomize_content.push_str("\n# Enable pytest_rt plugin\n");
+            sitecustomize_content.push_str("from enable_pytest_rt import enable\n");
+            sitecustomize_content.push_str("enable()\n");
+
+            fs::write(sitecustomize_path, sitecustomize_content)?;
         }
-        writeln!(sitecustomize)?;
-        {
-            writeln!(sitecustomize, "# Environment variables from rt.toml")?;
-            for (key, val) in self.run_env.as_ref() {
-                writeln!(
-                    sitecustomize,
-                    "os.environ[{}] = {}",
-                    python_string_literal(key),
-                    python_string_literal(val)
-                )?;
-            }
-        }
-        writeln!(sitecustomize)?;
-        {
-            if let Some(plugin_dir) = self
-                .pytest_plugin_dir
-                .as_ref()
-                .filter(|plugin_dir| plugin_dir.is_dir())
-            {
-                fs::write(
-                    site_packages_path.join("pytest-rt.pth"),
-                    format!("{}\n", plugin_dir.to_string_lossy()),
-                )?;
-                writeln!(sitecustomize, "# rt pytest plugin")?;
-                writeln!(
-                sitecustomize,
-                "plugins = [p.strip() for p in os.environ.get('PYTEST_PLUGINS', '').split(',') if p.strip()]"
-            )?;
-                writeln!(sitecustomize, "if \"rt\" not in plugins:",)?;
-                writeln!(sitecustomize, "    plugins.append(\"rt\")",)?;
-                writeln!(
-                    sitecustomize,
-                    "os.environ['PYTEST_PLUGINS'] = ','.join(plugins)"
-                )?;
-                writeln!(sitecustomize)?;
-            }
-        }
-        sitecustomize.flush()?;
+
         Ok(())
     }
 }
@@ -441,29 +415,6 @@ fn get_deps_install_path(riot_root: &Path, hash: &str) -> PathBuf {
     deps_install_path.push(VENV_DEPS_DIR);
     deps_install_path.push(format!("deps_{hash}"));
     deps_install_path
-}
-
-fn python_string_literal<S: AsRef<OsStr>>(value: S) -> String {
-    let value = value.as_ref().to_str().unwrap();
-    let mut literal = String::with_capacity(value.len() + 2);
-    literal.push('"');
-    for ch in value.chars() {
-        match ch {
-            '\\' => literal.push_str("\\\\"),
-            '"' => literal.push_str("\\\""),
-            '\n' => literal.push_str("\\n"),
-            '\r' => literal.push_str("\\r"),
-            '\t' => literal.push_str("\\t"),
-            ch if ch.is_control() => {
-                literal.push_str("\\x");
-                FmtWrite::write_fmt(&mut literal, format_args!("{:02x}", ch as u32))
-                    .expect("write to string");
-            }
-            ch => literal.push(ch),
-        }
-    }
-    literal.push('"');
-    literal
 }
 
 fn format_requirements(pkgs: &IndexMap<String, String>) -> String {

@@ -12,7 +12,7 @@ pub struct RepoConfig {
     pub riot_root: PathBuf,
     pub build_env: Arc<HashMap<String, String>>,
     pub run_env: Arc<HashMap<String, String>>,
-    pub pytest_plugin_dir: Option<PathBuf>,
+    pub pytest_plugin_dir: PathBuf,
 }
 
 pub enum Selector {
@@ -31,14 +31,18 @@ pub struct RunConfig {
 }
 
 impl RepoConfig {
-    pub fn load(riotfile_path: &Path, riot_root: &Path) -> PyResult<Self> {
-        let (build_env, run_env) = load_rt_toml(riotfile_path)?;
+    pub fn load(
+        riotfile_path: PathBuf,
+        riot_root: PathBuf,
+        pytest_plugin_dir: PathBuf,
+    ) -> PyResult<Self> {
+        let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
         Ok(Self {
-            riotfile_path: riotfile_path.to_path_buf(),
-            riot_root: riot_root.to_path_buf(),
+            riotfile_path,
+            riot_root,
             build_env: Arc::new(build_env),
             run_env: Arc::new(run_env),
-            pytest_plugin_dir: None,
+            pytest_plugin_dir,
         })
     }
 }
