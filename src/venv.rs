@@ -72,18 +72,26 @@ pub struct RiotVenv {
     pub python: String,
     pub pkgs: IndexMap<String, String>,
     pub hash: String,
+    pub services: Vec<String>,
     pub execution_contexts: Vec<ExecutionContext>,
     pub shared_pkgs: IndexMap<String, String>,
     pub shared_env: IndexMap<String, String>,
 }
 
 impl RiotVenv {
-    fn new(name: String, python: String, pkgs: IndexMap<String, String>, hash: String) -> Self {
+    fn new(
+        name: String,
+        python: String,
+        pkgs: IndexMap<String, String>,
+        hash: String,
+        services: Vec<String>,
+    ) -> Self {
         Self {
             name,
             python,
             pkgs,
             hash,
+            services,
             execution_contexts: Vec::new(),
             shared_pkgs: IndexMap::new(),
             shared_env: IndexMap::new(),
@@ -210,13 +218,47 @@ impl ExecutionContext {
 }
 
 /// Expand every leaf of a virtualenv tree into a concrete configuration grouped by base hash.
-fn normalize_venvs(py: Python<'_>, root: &PyVenv) -> IndexMap<String, RiotVenv> {
+fn normalize_venvs(
+    py: Python<'_>,
+    root: &PyVenv,
+    project_path: &Path,
+) -> IndexMap<String, RiotVenv> {
     let mut venvs = IndexMap::new();
-    collect_riot_venvs(py, root, &ResolvedSpec::default(), &mut venvs);
+    let service_map = get_services(py, project_path);
+    collect_riot_venvs(
+        py,
+        root,
+        &ResolvedSpec::default(),
+        &mut venvs,
+        service_map.as_ref(),
+    );
     for venv in venvs.values_mut() {
         venv.shared_env = shared_entries(venv.execution_contexts.iter().map(|ctx| &ctx.env));
     }
     venvs
+}
+
+fn get_services(py: Python<'_>, project_path: &Path) -> Option<HashMap<String, Vec<String>>> {
+    let python_code = format!(
+        r#"
+import sys
+sys.path.insert(0, r"{}")
+
+from tests.suitespec import SUITESPEC
+result = {{ k.split("::")[-1]: (v.get("services", []) + ["testagent"] if v.get("snapshot") else []) for k, v in SUITESPEC["suites"].items() if v.get("services") }}
+"#,
+        project_path.to_string_lossy()
+    );
+
+    let code_cstr = CString::new(python_code).ok()?;
+    let module_name = c"_get_service";
+    let filename = c"get_services";
+
+    let result: Result<HashMap<String, Vec<String>>, PyErr> =
+        PyModule::from_code(py, code_cstr.as_c_str(), filename, module_name)
+            .and_then(|module| module.getattr("result")?.extract());
+
+    result.ok()
 }
 
 fn collect_riot_venvs(
@@ -224,6 +266,7 @@ fn collect_riot_venvs(
     venv: &PyVenv,
     state: &ResolvedSpec,
     acc: &mut IndexMap<String, RiotVenv>,
+    service_map: Option<&HashMap<String, Vec<String>>>,
 ) {
     let Some(next_state) = state.merge(venv) else {
         return;
@@ -245,8 +288,18 @@ fn collect_riot_venvs(
                     let hash =
                         RiotHasher::hash_parts(&[&name_repr, &interpreter_repr, &full_pkg_str]);
 
+                    let services = service_map.map_or_else(
+                        Vec::new,
+                        |service_map| service_map.get(name).cloned().unwrap_or_default(),
+                    );
                     let entry = acc.entry(hash.clone()).or_insert_with(|| {
-                        RiotVenv::new(name.clone(), py_version.clone(), pkgs.clone(), hash.clone())
+                        RiotVenv::new(
+                            name.clone(),
+                            py_version.clone(),
+                            pkgs.clone(),
+                            hash.clone(),
+                            services,
+                        )
                     });
 
                     let command = next_state.command.clone();
@@ -286,7 +339,7 @@ fn collect_riot_venvs(
     }
 
     for child in &venv.venvs {
-        collect_riot_venvs(py, child, &next_state, acc);
+        collect_riot_venvs(py, child, &next_state, acc, service_map);
     }
 }
 
@@ -647,7 +700,8 @@ pub fn select_execution_contexts(
     selector: Selector,
 ) -> PyResult<Vec<RiotVenv>> {
     let root = load_riotfile(py, riotfile_path)?;
-    let mut riot_venvs = normalize_venvs(py, &root);
+    let project_path = riotfile_path.parent().unwrap();
+    let mut riot_venvs = normalize_venvs(py, &root, project_path);
 
     let (pattern_selector, python_selector) = match selector {
         Selector::All => (String::new(), None),

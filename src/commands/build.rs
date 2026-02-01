@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
+    fmt::Write as FmtWrite,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,8 +12,8 @@ use crate::{
     command::ManagedCommand,
     config::Selector,
     progress::{
-        summarize_errors, MultiplexedProgressLogger, ProgressLogger, StepContext, StepId,
-        StepOutcome, Task, TaskRunner,
+        summarize_errors, MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger,
+        StepContext, StepId, StepOutcome, Task, TaskRunner,
     },
     venv::{venv_path, ExecutionContext, RiotVenv},
 };
@@ -67,7 +68,14 @@ pub fn build_selected_contexts(
         eprintln!("error: could not create riot root: {e}");
         return Err(PyErr::new::<PySystemExit, _>(1));
     }
-    let sink: Arc<dyn ProgressLogger> = Arc::new(MultiplexedProgressLogger::new().unwrap());
+    let sink: Arc<dyn ProgressLogger> = if io::stderr().is_terminal() {
+        match MultiplexedProgressLogger::new() {
+            Ok(logger) => Arc::new(logger),
+            Err(_) => Arc::new(PlainProgressLogger::default()),
+        }
+    } else {
+        Arc::new(PlainProgressLogger::default())
+    };
     let shared = Arc::new(BuildSharedState::new(
         force_reinstall,
         Arc::clone(&repo.build_env),
@@ -154,7 +162,7 @@ pub struct BuildSharedState {
 }
 
 impl BuildSharedState {
-    pub fn new(
+    pub const fn new(
         force_reinstall: bool,
         build_env: Arc<HashMap<String, String>>,
         run_env: Arc<HashMap<String, String>>,
@@ -253,7 +261,7 @@ impl BuildSharedState {
             .arg("--target")
             .arg(&deps_install_path)
             .arg("--requirement")
-            .arg(&requirements_file.path())
+            .arg(requirements_file.path())
             .status()?;
 
         if !status.success() {
@@ -309,6 +317,7 @@ impl BuildSharedState {
             &deps_install_path,
             dev_install_path.as_ref(),
             &site_packages_path,
+            &venv.services,
         )?;
 
         let mut bin_sources: Vec<&Path> = Vec::new();
@@ -329,12 +338,13 @@ impl BuildSharedState {
         deps_install_path: &Path,
         dev_install_path: Option<&PathBuf>,
         site_packages_path: &Path,
+        services: &[String],
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         fs::create_dir_all(site_packages_path)?;
 
         let current_dir = self.riot_root.parent().ok_or_else(|| {
             eprintln!("error: could not find riot root parent");
-            return PyErr::new::<PySystemExit, _>(1);
+            PyErr::new::<PySystemExit, _>(1)
         })?;
 
         let mut paths = vec![];
@@ -356,7 +366,7 @@ impl BuildSharedState {
             let pth_file = site_packages_path.join("riot.pth");
             let pth_content = paths
                 .iter()
-                .map(|(path, comment)| format!("# {}\n{}", comment, path))
+                .map(|(path, comment)| format!("# {comment}\n{path}"))
                 .join("\n");
             fs::write(pth_file, pth_content)?;
         }
@@ -368,16 +378,17 @@ impl BuildSharedState {
 
             // adding paths in sitecustomize is necessary to include transitive .pth files
             for (path, comment) in paths {
-                sitecustomize_content
-                    .push_str(&format!("site.addsitedir(r\"{}\") # {}\n", path, comment));
+                writeln!(
+                    sitecustomize_content,
+                    "site.addsitedir(r\"{path}\") # {comment}"
+                )?;
             }
 
             // environment variables from riotfile.py
             if !exc.env.is_empty() {
                 sitecustomize_content.push_str("\n# Environment variables from riotfile.py\n");
                 for (key, val) in &exc.env {
-                    sitecustomize_content
-                        .push_str(&format!("os.environ[r\"{}\"] = r\"{}\"\n", key, val));
+                    writeln!(sitecustomize_content, "os.environ[r\"{key}\"] = r\"{val}\"")?;
                 }
             }
 
@@ -385,8 +396,7 @@ impl BuildSharedState {
             if !self.run_env.is_empty() {
                 sitecustomize_content.push_str("\n# Environment variables from rt.toml\n");
                 for (key, val) in self.run_env.iter() {
-                    sitecustomize_content
-                        .push_str(&format!("os.environ[r\"{}\"] = r\"{}\"\n", key, val));
+                    writeln!(sitecustomize_content, "os.environ[r\"{key}\"] = r\"{val}\"")?;
                 }
             }
 
@@ -394,6 +404,26 @@ impl BuildSharedState {
             sitecustomize_content.push_str("\n# Enable pytest_rt plugin\n");
             sitecustomize_content.push_str("from enable_pytest_rt import enable\n");
             sitecustomize_content.push_str("enable()\n");
+            let services_csv = services.join(",");
+            let project_root = current_dir.to_string_lossy();
+            writeln!(
+                sitecustomize_content,
+                "os.environ[\"SUITESPEC_SERVICES\"] = r\"{services_csv}\""
+            )?;
+            writeln!(
+                sitecustomize_content,
+                "os.environ[\"RIOT_PROJECT_ROOT\"] = r\"{project_root}\""
+            )?;
+            if services.iter().any(|svc| svc == "testagent") {
+                writeln!(
+                    sitecustomize_content,
+                    "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # Configure testagent url"
+                )?;
+            }
+            writeln!(
+                sitecustomize_content,
+                "os.environ[\"PYTHONPATH\"] = r\"{project_root}\" # Redundant but some tests assume that this env var is not empty..."
+            )?;
 
             fs::write(sitecustomize_path, sitecustomize_content)?;
         }

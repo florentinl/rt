@@ -51,7 +51,7 @@ export class RtCliService {
         {
           cwd: options?.cwd,
           maxBuffer: MAX_BUFFER_BYTES,
-          env: { DD_FAST_BUILD: "1" },
+          env: { ...process.env, DD_FAST_BUILD: "1" },
         },
         (err, stdout, stderr) => {
           if (finished) {
