@@ -1,6 +1,8 @@
 use std::{
-    ffi::OsStr,
+    env,
+    ffi::{OsStr, OsString},
     io::{self, BufReader, Read},
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::Arc,
     thread,
@@ -37,7 +39,7 @@ impl ManagedCommand {
 
     #[must_use]
     pub fn new_uv(subcommand: &str, sink: Arc<dyn ProgressLogger>, step_id: StepId) -> Self {
-        Self::new("uv", step_id, sink)
+        Self::new(resolve_uv_path(), step_id, sink)
             .arg(subcommand)
             .arg("--no-config")
             .arg("--color=always")
@@ -168,5 +170,52 @@ impl ManagedCommand {
 
             sink.flush_output(&step_id);
         })
+    }
+}
+
+fn resolve_uv_path() -> OsString {
+    if let Some(path) = env::var_os("RT_UV_PATH") {
+        if !path.is_empty() {
+            return path;
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(path) = uv_in_dir(dir) {
+                return path.into_os_string();
+            }
+        }
+    }
+
+    if let Some(venv) = env::var_os("VIRTUAL_ENV") {
+        let venv_dir = Path::new(&venv);
+        let candidate_dir = if cfg!(windows) {
+            venv_dir.join("Scripts")
+        } else {
+            venv_dir.join("bin")
+        };
+        if let Some(path) = uv_in_dir(&candidate_dir) {
+            return path.into_os_string();
+        }
+    }
+
+    OsString::from("uv")
+}
+
+fn uv_in_dir(dir: &Path) -> Option<PathBuf> {
+    let candidate = dir.join(uv_executable_name());
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+const fn uv_executable_name() -> &'static str {
+    if cfg!(windows) {
+        "uv.exe"
+    } else {
+        "uv"
     }
 }

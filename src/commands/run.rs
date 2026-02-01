@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::IsTerminal, sync::Arc};
 
 use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
 
@@ -38,7 +38,12 @@ pub fn run(
     build_selected_contexts(repo, &selected, force_reinstall)?;
 
     let sink: Arc<dyn ProgressLogger> = match parallel {
-        Some(n) if n > 0 => Arc::new(MultiplexedProgressLogger::new().unwrap()),
+        Some(n) if n > 0 && std::io::stderr().is_terminal() => {
+            match MultiplexedProgressLogger::new() {
+                Ok(logger) => Arc::new(logger),
+                Err(_) => Arc::new(PlainProgressLogger::default()),
+            }
+        }
         _ => Arc::new(PlainProgressLogger::default()),
     };
 
