@@ -362,7 +362,7 @@ impl BuildSharedState {
         ));
 
         {
-            // pth file is necessary for analysis tools that do not execute sitecustomize.py
+            // pth file is mostly for analysis tools that do not execute sitecustomize.py to query site dirs
             let pth_file = site_packages_path.join("riot.pth");
             let pth_content = paths
                 .iter()
@@ -376,7 +376,7 @@ impl BuildSharedState {
             let mut sitecustomize_content = String::new();
             sitecustomize_content.push_str("import site, os\n");
 
-            // adding paths in sitecustomize is necessary to include transitive .pth files
+            // adding paths in sitecustomize is necessary to include .pth files in each of these folders
             for (path, comment) in paths {
                 writeln!(
                     sitecustomize_content,
@@ -400,30 +400,38 @@ impl BuildSharedState {
                 }
             }
 
-            // enable pytest rt
-            sitecustomize_content.push_str("\n# Enable pytest_rt plugin\n");
-            sitecustomize_content.push_str("from enable_pytest_rt import enable\n");
-            sitecustomize_content.push_str("enable()\n");
+            writeln!(sitecustomize_content, "")?;
+            writeln!(sitecustomize_content, "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command")?;
+            writeln!(sitecustomize_content, "import enable_pytest_rt")?;
+
             let services_csv = services.join(",");
             let project_root = current_dir.to_string_lossy();
+
             writeln!(
                 sitecustomize_content,
-                "os.environ[\"SUITESPEC_SERVICES\"] = r\"{services_csv}\""
-            )?;
-            writeln!(
-                sitecustomize_content,
-                "os.environ[\"RIOT_PROJECT_ROOT\"] = r\"{project_root}\""
+                "os.environ[\"PYTHONPATH\"] = r\"{project_root}\" # Functionally useless but some tests assume that this env var is not empty..."
             )?;
             if services.iter().any(|svc| svc == "testagent") {
                 writeln!(
                     sitecustomize_content,
-                    "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # Configure testagent url"
+                    "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # configure testagent url because testagent service is enable"
                 )?;
             }
+
             writeln!(
                 sitecustomize_content,
-                "os.environ[\"PYTHONPATH\"] = r\"{project_root}\" # Redundant but some tests assume that this env var is not empty..."
+                "os.environ[\"RIOT_SUITESPEC_SERVICES\"] = r\"{services_csv}\" # store services to start for pytest_rt plugin"
             )?;
+            writeln!(
+                sitecustomize_content,
+                "os.environ[\"RIOT_PROJECT_ROOT\"] = r\"{project_root}\" # store riot project root for pytest_rt plugin"
+            )?;
+            if let Some(command) = exc.command.as_ref() {
+                writeln!(
+                    sitecustomize_content,
+                    "os.environ[\"RIOT_ORIGINAL_COMMAND\"] = r\"{command}\" # store riotfile.py command for pytest_rt plugin"
+                )?;
+            }
 
             fs::write(sitecustomize_path, sitecustomize_content)?;
         }
