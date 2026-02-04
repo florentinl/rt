@@ -1,23 +1,29 @@
 """
 Pytest plugin to strip the global Python-version suffix added by tests/conftest.py.
 
-It has two functions:
+It has three functions:
 - restore the original item names and nodeids so that IDE integrations can map collected tests correctly.
 - start and stop suitespec services
+- restore the datadog service, as if it was parsed from the command in the riotfile.py
 """
+
+from time import sleep
+
+import contextlib
 
 import subprocess
 
 import sys
 import os
+import shlex
 from typing import Iterable
 from contextlib import suppress
 
-with suppress(Exception):
-    import pytest  # type: ignore
+_PY_TAG = f"py{sys.version_info.major}.{sys.version_info.minor}"
+_PY_SUFFIX = f"[{_PY_TAG}]"
 
-    _PY_TAG = f"py{sys.version_info.major}.{sys.version_info.minor}"
-    _PY_SUFFIX = f"[{_PY_TAG}]"
+with suppress(Exception):
+    import pytest
 
     def _strip_suffix(value: str) -> str:
         if value.endswith(_PY_SUFFIX):
@@ -33,32 +39,54 @@ with suppress(Exception):
             # nodeid is stored on the private _nodeid attribute when mutation is needed
             item._nodeid = _strip_suffix(item.nodeid)
 
-    _SERVICES_OWNER_ENV = "PYTEST_RT_SERVICES_OWNER_PID"
+    _RIOT_ENTRYPOINT_ENV = "RIOT_ENTRYPOINT_PID"
 
-    def _is_services_owner() -> bool:
-        owner_pid = os.environ.get(_SERVICES_OWNER_ENV)
+    def _is_entrypoint() -> bool:
+        owner_pid = os.environ.get(_RIOT_ENTRYPOINT_ENV)
         if not owner_pid:
-            os.environ[_SERVICES_OWNER_ENV] = str(os.getpid())
+            os.environ[_RIOT_ENTRYPOINT_ENV] = str(os.getpid())
             return True
         return owner_pid == str(os.getpid())
 
     def pytest_sessionstart(session):
-        suitespec_services = os.getenv("SUITESPEC_SERVICES", "")
-        if suitespec_services == "":
+        if not _is_entrypoint():
             return
-        if not _is_services_owner():
-            return
-        project_root = os.getenv("RIOT_PROJECT_ROOT", "")
-        services = suitespec_services.split(",")
+        suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
+        if suitespec_services != "":
+            print("=== starting services ===")
+            project_root = os.getenv("RIOT_PROJECT_ROOT", "")
+            services = suitespec_services.split(",")
+            subprocess.run(
+                ["docker", "compose", "up", "-d", *services], cwd=project_root
+            )
+            sleep(5)  # Wait a bit for services (postgresql mainly) to be ready
 
-        print("=== starting services ===")
-        subprocess.run(["docker", "compose", "up", "-d", *services], cwd=project_root)
+        # Restore service name (otherwise it can be overriden to something like `vscode_pytest`)
+        with contextlib.suppress(Exception):
+            command_line = os.getenv("RIOT_ORIGINAL_COMMAND")
+            if not command_line:
+                return
+            argv = shlex.split(command_line)
+
+            from ddtrace.internal.settings._inferred_base_service import detect_service
+            from ddtrace.internal.schema.processor import BaseServiceProcessor
+            from ddtrace import config
+            from ddtrace import tracer
+
+            original_service = detect_service(argv)
+
+            for processor in tracer._span_aggregator.dd_processors:
+                if isinstance(processor, BaseServiceProcessor):
+                    processor._global_service = original_service
+
+            config._inferred_base_service = original_service
+            config.service = original_service
 
     def pytest_sessionfinish(session, exitstatus):
-        suitespec_services = os.getenv("SUITESPEC_SERVICES", "")
-        if suitespec_services == "":
+        if not _is_entrypoint():
             return
-        if not _is_services_owner():
+        suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
+        if suitespec_services == "":
             return
         project_root = os.getenv("RIOT_PROJECT_ROOT", "")
         services = suitespec_services.split(",")

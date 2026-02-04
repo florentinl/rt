@@ -25,4 +25,8 @@ include = ["pytest_rt/**/*"]
 exclude = ["pytest_rt/**/__pycache__/"]
 
 [dependency-groups]
-dev = ["maturin>=1.9.6"]
+dev = [
+    "ddtrace>=4.3.2",
+    "maturin>=1.9.6",
+    "pytest>=8.4.2",
+]
