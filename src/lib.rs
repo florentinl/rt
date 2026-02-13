@@ -158,6 +158,18 @@ enum Commands {
         #[arg(long = "force-reinstall")]
         force_reinstall: bool,
     },
+    /// Build the virtual environment and link it as .venv in the riotfile directory.
+    Switch {
+        /// Execution or venv hash.
+        #[arg(
+            value_name = "HASH",
+            add = ArgValueCompleter::new(completion::HashCompleter)
+        )]
+        hash: String,
+        /// Force reinstalling cached dependencies before preparing the environment.
+        #[arg(long = "force-reinstall")]
+        force_reinstall: bool,
+    },
     /// Remove all cached virtual environments while keeping compiled requirements.
     Clean,
 }
@@ -227,6 +239,10 @@ fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
             hash,
             force_reinstall,
         } => commands::activate::run(py, repo, &hash, force_reinstall),
+        Commands::Switch {
+            hash,
+            force_reinstall,
+        } => commands::switch::run(py, repo, &hash, force_reinstall),
         Commands::Clean => commands::clean::run(&repo.riot_root),
         Commands::Completions { .. } => unreachable!(),
     }

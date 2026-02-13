@@ -6,3 +6,4 @@ pub mod describe;
 pub mod list;
 pub mod run;
 pub mod shell;
+pub mod switch;
