@@ -245,7 +245,7 @@ import sys
 sys.path.insert(0, r"{}")
 
 from tests.suitespec import SUITESPEC
-result = {{ k.split("::")[-1]: (v.get("services", []) + ["testagent"] if v.get("snapshot") else []) for k, v in SUITESPEC["suites"].items() if v.get("services") }}
+result = {{ k.split("::")[-1]: (v.get("services", []) + ["testagent"] if v.get("snapshot") else []) for k, v in SUITESPEC["suites"].items() if v.get("services") or v.get("snapshot") }}
 "#,
         project_path.to_string_lossy()
     );
@@ -288,10 +288,9 @@ fn collect_riot_venvs(
                     let hash =
                         RiotHasher::hash_parts(&[&name_repr, &interpreter_repr, &full_pkg_str]);
 
-                    let services = service_map.map_or_else(
-                        Vec::new,
-                        |service_map| service_map.get(name).cloned().unwrap_or_default(),
-                    );
+                    let services = service_map.map_or_else(Vec::new, |service_map| {
+                        service_map.get(name).cloned().unwrap_or_default()
+                    });
                     let entry = acc.entry(hash.clone()).or_insert_with(|| {
                         RiotVenv::new(
                             name.clone(),
