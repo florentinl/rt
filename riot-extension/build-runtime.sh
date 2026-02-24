@@ -2,7 +2,7 @@
 set -euo pipefail
 
 uv python install 3.14 --install-dir=dist --no-config --no-bin
-mv dist/cpython* python
+mv dist/cpython*/ python
 rm -rf dist
 uv pip install --no-config --python ./python .. --break-system-packages
 

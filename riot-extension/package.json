@@ -1,9 +1,9 @@
 {
-  "name": "riot-venv-manager",
+  "name": "riot-python-environments",
   "publisher": "florentinl",
   "displayName": "[WIP] Riot Python Environments",
   "description": "Riot plugin for the Python Environments extension",
-  "version": "0.0.8",
+  "version": "0.1.0",
   "repository": "https://github.com/florentinl/rt.git",
   "engines": {
     "vscode": "^1.107.0"
