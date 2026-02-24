@@ -2,7 +2,7 @@
 set -euo pipefail
 
 uv python install 3.14 --install-dir=dist --no-config --no-bin
-mv dist/cpython* python
+mv dist/cpython*/ python
 rm -rf dist
 uv pip install --no-config --python ./python .. --break-system-packages
 
@@ -14,9 +14,9 @@ esac
 
 here=$(pwd)
 if [[ $machine == "macos" ]]; then
-    grep -rlI "$here" python | xargs sed -i '' "s|$here|<RT_BUNDLED_PYTHON>|g"
+    grep -rlI "$here" python | xargs sed -i '' "s|$here|/Users/florentin.labelle/go/src/github.com/DataDog/rt/riot-extension|g"
 else
-    grep -rlI "$here" python | xargs sed -i "s|$here|<RT_BUNDLED_PYTHON>|g"
+    grep -rlI "$here" python | xargs sed -i "s|$here|/Users/florentin.labelle/go/src/github.com/DataDog/rt/riot-extension|g"
 fi
 
 # Remove Python cache files and directories
