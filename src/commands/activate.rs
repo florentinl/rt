@@ -1,16 +1,27 @@
 use std::path::Path;
 
-use pyo3::{PyResult, Python};
+use indexmap::IndexMap;
+use pyo3::PyResult;
 
 use crate::{
     commands::{build::build_selected_contexts, shell::resolve_target},
     config::RepoConfig,
-    ui, venv,
+    ui,
+    venv::{self, RiotVenv},
 };
 
 /// Build the requested environment and print the activation script path.
-pub fn run(py: Python<'_>, repo: &RepoConfig, hash: &str, force_reinstall: bool) -> PyResult<()> {
-    let target = resolve_target(py, &repo.riotfile_path, hash)?;
+///
+/// # Errors
+///
+/// Returns an error if the target cannot be resolved or the environment build fails.
+pub fn run(
+    venvs: IndexMap<String, RiotVenv>,
+    repo: &RepoConfig,
+    hash: &str,
+    force_reinstall: bool,
+) -> PyResult<()> {
+    let target = resolve_target(venvs, hash)?;
     let ctx_hash = &target.execution_contexts[0].hash;
     build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall)?;
     let activation_path = activation_path(ctx_hash, &repo.riot_root);

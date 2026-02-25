@@ -14,6 +14,3 @@ pub const VENV_SELF_DIR: &str = "venv_self";
 
 /// Dependencies install directory name
 pub const VENV_DEPS_DIR: &str = "venv_deps";
-
-/// Pytest plugin module shipped with the rt package
-pub const PYTEST_PLUGIN_MODULE: &str = "pytest_rt.pytest_rt";

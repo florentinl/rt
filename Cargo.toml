@@ -1,14 +1,18 @@
 [package]
 name = "rt"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-[lib]
-name = "riot"
-crate-type = ["cdylib", "rlib"]
+[profile.release]
+strip = true
+lto = "fat"
 
 [dependencies]
+uv = { version = "0.10.6", default-features = false, features = [
+    "performance",
+    "performance-memory-allocator",
+] }
+
 pyo3 = "0.28.2"
 rayon = "1.11.0"
 
@@ -26,3 +30,4 @@ itertools = "0.14"
 tempfile = "3.26"
 sha2 = "0.10"
 fancy-regex = "0.17.0"
+serde_yaml = "0.9.34"

@@ -76,8 +76,4 @@ docs/_build/
 node_modules/
 
 # Extension runtime (bundled artifacts)
-riot-extension/runtime/python/
-!riot-extension/runtime/bin/
-!riot-extension/runtime/bin/rt
-!riot-extension/runtime/libexec/
-!riot-extension/runtime/libexec/uv
+riot-extension/rt

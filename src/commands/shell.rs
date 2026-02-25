@@ -1,12 +1,11 @@
 use std::{
     env,
     ffi::OsString,
-    path::Path,
     process::{Command, Stdio},
 };
 
 use indexmap::IndexMap;
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
+use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 
 use crate::{
     commands::build::build_selected_contexts,
@@ -16,8 +15,17 @@ use crate::{
 };
 
 /// Build the requested environment and spawn an interactive shell with it active.
-pub fn run(py: Python<'_>, repo: &RepoConfig, hash: &str, force_reinstall: bool) -> PyResult<()> {
-    let target = resolve_target(py, &repo.riotfile_path, hash)?;
+///
+/// # Errors
+///
+/// Returns an error if the target cannot be resolved, built, or launched.
+pub fn run(
+    venvs: IndexMap<String, RiotVenv>,
+    repo: &RepoConfig,
+    hash: &str,
+    force_reinstall: bool,
+) -> PyResult<()> {
+    let target = resolve_target(venvs, hash)?;
 
     build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall)?;
     let ctx = &target.execution_contexts[0];
@@ -28,9 +36,13 @@ pub fn run(py: Python<'_>, repo: &RepoConfig, hash: &str, force_reinstall: bool)
     Ok(())
 }
 
-pub fn resolve_target(py: Python<'_>, riotfile_path: &Path, hash: &str) -> PyResult<RiotVenv> {
-    let mut venvs =
-        select_execution_contexts(py, riotfile_path, Selector::Pattern(hash.to_string()))?;
+/// Resolve a selector to a single venv, narrowing to an execution context when needed.
+///
+/// # Errors
+///
+/// Returns an error if selection is ambiguous or selection fails.
+pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> PyResult<RiotVenv> {
+    let mut venvs = select_execution_contexts(venvs, Selector::Pattern(hash.to_string()))?;
     if venvs.len() != 1 {
         eprintln!("Found multiple corresponding virtual environments, aborting...");
         return Err(PyErr::new::<PySystemExit, _>(1));
@@ -56,6 +68,7 @@ pub fn resolve_target(py: Python<'_>, riotfile_path: &Path, hash: &str) -> PyRes
     Ok(venv)
 }
 
+#[must_use] 
 pub fn make_venv_shell_context(venv: &RiotVenv) -> ExecutionContext {
     ExecutionContext {
         command: None,

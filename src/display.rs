@@ -159,7 +159,6 @@ enum StepRenderStyle {
 /// A single build step with its output buffer.
 #[derive(Debug, Clone)]
 pub struct BuildStep {
-    pub id: String,
     pub description: String,
     pub status: StepStatus,
     pub output_lines: VecDeque<String>,
@@ -171,9 +170,8 @@ pub struct BuildStep {
 impl BuildStep {
     /// Create a new build step in Pending state.
     #[must_use]
-    pub const fn new(id: String, description: String) -> Self {
+    pub const fn new(description: String) -> Self {
         Self {
-            id,
             description,
             status: StepStatus::Pending,
             output_lines: VecDeque::new(),
@@ -325,10 +323,10 @@ impl DisplayManager {
     ///
     /// Panics if the internal mutex is poisoned.
     pub fn register_step(&self, id: &str, description: &str) {
-        self.steps.lock().unwrap().insert(
-            id.to_string(),
-            BuildStep::new(id.to_string(), description.to_string()),
-        );
+        self.steps
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), BuildStep::new(description.to_string()));
         self.final_rendered.store(false, Ordering::Relaxed);
     }
 

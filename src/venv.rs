@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::ffi::CString;
+use std::process::exit;
 
 use fancy_regex::Regex;
 use indexmap::{IndexMap, IndexSet};
@@ -16,6 +17,7 @@ use shell_words::split;
 
 use crate::config::Selector;
 use crate::constants::VENV_PREFIX;
+use crate::fake_ruamel_yaml;
 
 #[derive(Clone)]
 #[pyclass(from_py_object, name = "Venv", module = "riot")]
@@ -112,11 +114,13 @@ pub struct ExecutionContext {
 
 /// Compute the virtual environment path from the riot root and short hash.
 /// The '@' character in the `short_hash` is replaced with '_' for filesystem compatibility.
+#[must_use]
 pub fn venv_path(riot_root: &Path, short_hash: &str) -> PathBuf {
     riot_root.join(format!("{}{}", VENV_PREFIX, short_hash.replace('@', "_")))
 }
 
 /// Compute the python executable path for a virtual environment.
+#[must_use]
 pub fn venv_python_path(riot_root: &Path, short_hash: &str) -> String {
     venv_path(riot_root, short_hash)
         .join("bin/python")
@@ -185,10 +189,10 @@ impl ResolvedSpec {
             pys = Some(parent_pys.clone());
         }
 
-        if let Some(values) = pys.as_ref() {
-            if values.is_empty() {
-                return None;
-            }
+        if let Some(values) = pys.as_ref()
+            && values.is_empty()
+        {
+            return None;
         }
         next.pys = pys;
 
@@ -217,6 +221,19 @@ impl ExecutionContext {
     }
 }
 
+#[must_use]
+/// Load and normalize venv definitions from the riotfile.
+///
+/// # Panics
+///
+/// Panics if `riotfile_path` has no parent directory.
+pub fn get_context(py: Python<'_>, riotfile_path: &Path) -> IndexMap<String, RiotVenv> {
+    let root = load_riotfile(py, riotfile_path);
+    let project_path = riotfile_path.parent().unwrap();
+
+    normalize_venvs(py, &root, project_path)
+}
+
 /// Expand every leaf of a virtualenv tree into a concrete configuration grouped by base hash.
 fn normalize_venvs(
     py: Python<'_>,
@@ -226,7 +243,6 @@ fn normalize_venvs(
     let mut venvs = IndexMap::new();
     let service_map = get_services(py, project_path);
     collect_riot_venvs(
-        py,
         root,
         &ResolvedSpec::default(),
         &mut venvs,
@@ -254,6 +270,24 @@ result = {{ k.split("::")[-1]: (v.get("services", []) + ["testagent"] if v.get("
     let module_name = c"_get_service";
     let filename = c"get_services";
 
+    let load_ruamel_module = || -> PyResult<()> {
+        let sys = py.import("sys")?;
+        let modules = sys.getattr("modules")?;
+        let modules: &Bound<'_, PyDict> = modules.cast()?;
+        let yaml_module = fake_ruamel_yaml::get_fake_ruamel_yaml(py)?;
+        let ruamel_module = PyModule::new(py, "ruamel")?;
+        ruamel_module.add("yaml", &yaml_module)?;
+        modules.set_item("ruamel", &ruamel_module)?;
+        modules.set_item("ruamel.yaml", yaml_module)?;
+
+        Ok(())
+    };
+
+    if let Err(err) = load_ruamel_module() {
+        eprintln!("error: could not properly load ruamel.yaml module: {err}");
+        exit(1)
+    }
+
     let result: Result<HashMap<String, Vec<String>>, PyErr> =
         PyModule::from_code(py, code_cstr.as_c_str(), filename, module_name)
             .and_then(|module| module.getattr("result")?.extract());
@@ -262,7 +296,6 @@ result = {{ k.split("::")[-1]: (v.get("services", []) + ["testagent"] if v.get("
 }
 
 fn collect_riot_venvs(
-    py: Python,
     venv: &PyVenv,
     state: &ResolvedSpec,
     acc: &mut IndexMap<String, RiotVenv>,
@@ -281,10 +314,10 @@ fn collect_riot_venvs(
             }
 
             for py_version in pys {
-                let interpreter_repr = interpreter_repr(py, py_version);
+                let interpreter_repr = interpreter_repr(py_version);
                 for pkgs in &pkg_variants {
                     let full_pkg_str = pip_deps(pkgs);
-                    let name_repr = python_repr_str(py, name);
+                    let name_repr = python_repr_str(name);
                     let hash =
                         RiotHasher::hash_parts(&[&name_repr, &interpreter_repr, &full_pkg_str]);
 
@@ -306,7 +339,6 @@ fn collect_riot_venvs(
                     for env in &env_variants {
                         let context_env = env.clone();
                         let ctx_hash = RiotHasher::context_hash(
-                            py,
                             command.as_ref(),
                             &context_env,
                             next_state.create,
@@ -338,7 +370,7 @@ fn collect_riot_venvs(
     }
 
     for child in &venv.venvs {
-        collect_riot_venvs(py, child, &next_state, acc, service_map);
+        collect_riot_venvs(child, &next_state, acc, service_map);
     }
 }
 
@@ -437,6 +469,7 @@ fn parse_version_components(version: &str) -> Option<Vec<u32>> {
     Some(components)
 }
 
+#[must_use]
 pub fn compare_python_versions(lhs: &str, rhs: &str) -> Ordering {
     match (parse_version_components(lhs), parse_version_components(rhs)) {
         (Some(mut left), Some(mut right)) => {
@@ -477,16 +510,52 @@ fn python_versions_compatible(parent: &str, child: &str) -> bool {
     }
 }
 
-fn python_repr_str(py: Python<'_>, value: &str) -> String {
-    let py_str = PyString::new(py, value);
-    py_str.repr().map_or_else(
-        |_| format!("{value:?}"),
-        |repr_obj| repr_obj.extract().unwrap_or_else(|_| format!("{value:?}")),
-    )
+fn python_repr_str(value: &str) -> String {
+    // First pass: build with single quotes, escaping as Python typically would.
+    fn build(s: &str, quote: char) -> String {
+        let mut out = String::new();
+        out.push(quote);
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\x08' => out.push_str("\\b"),
+                '\x0c' => out.push_str("\\f"),
+                c if c == quote => {
+                    out.push('\\');
+                    out.push(c);
+                }
+                // Escape other ASCII control chars like Python repr does (\xhh)
+                c if (c as u32) < 0x20 || c == '\x7f' => {
+                    use std::fmt::Write;
+                    write!(&mut out, "\\x{:02x}", c as u32).ok();
+                }
+                // Keep other Unicode as-is (Python 3 repr keeps most unicode visible)
+                c => out.push(c),
+            }
+        }
+        out.push(quote);
+        out
+    }
+
+    let single = build(value, '\'');
+    let double = build(value, '"');
+
+    // Python tends to choose the quote that minimizes escaping.
+    let single_escapes = single.matches("\\'").count();
+    let double_escapes = double.matches("\\\"").count();
+
+    if double_escapes < single_escapes {
+        double
+    } else {
+        single
+    }
 }
 
-fn interpreter_repr(py: Python<'_>, py_hint: &str) -> String {
-    format!("Interpreter(_hint={})", python_repr_str(py, py_hint))
+fn interpreter_repr(py_hint: &str) -> String {
+    format!("Interpreter(_hint={})", python_repr_str(py_hint))
 }
 
 /// Extract long and short hash from Python hex string (strips '0x' prefix and takes first 7 chars).
@@ -530,14 +599,13 @@ impl RiotHasher {
     }
 
     fn context_hash(
-        py: Python<'_>,
         command: Option<&String>,
         env: &IndexMap<String, String>,
         create: bool,
         skip_dev_install: bool,
     ) -> String {
         let command_repr =
-            command.map_or_else(|| "None".to_string(), |value| python_repr_str(py, value));
+            command.map_or_else(|| "None".to_string(), |value| python_repr_str(value));
 
         let env_repr = if env.is_empty() {
             String::new()
@@ -577,50 +645,86 @@ fn parse_pytest_target(command: &str) -> Option<String> {
     None
 }
 
-fn missing_venv_err() -> PyErr {
-    eprintln!("error: riotfile does not define a `venv` variable");
-    PyErr::new::<PySystemExit, _>(1)
-}
+fn load_riotfile(py: Python<'_>, path: &Path) -> PyVenv {
+    let source = match fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(err) => {
+            eprintln!("error: failed to read riotfile: {err}");
+            exit(1)
+        }
+    };
 
-fn load_riotfile(py: Python<'_>, path: &Path) -> PyResult<PyVenv> {
-    let source = fs::read_to_string(path).map_err(|err| {
-        eprintln!("error: failed to read riotfile: {err}");
-        PyErr::new::<PySystemExit, _>(1)
-    })?;
+    let source_cstr = match CString::new(source) {
+        Ok(src) => src,
+        Err(err) => {
+            eprintln!("error: invalid riotfile content: {err}");
+            exit(1)
+        }
+    };
 
-    let source_cstr = CString::new(source).map_err(|err| {
-        eprintln!("error: invalid riotfile content: {err}");
-        PyErr::new::<PySystemExit, _>(1)
-    })?;
-
-    let module_name = CString::new(
+    let module_name = match CString::new(
         path.file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("riotfile"),
-    )
-    .map_err(|err| {
-        eprintln!("error: invalid module name: {err}");
-        PyErr::new::<PySystemExit, _>(1)
-    })?;
+    ) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("error: invalid module name: {err}");
+            exit(1);
+        }
+    };
 
-    let path_cstr = CString::new(path.to_string_lossy().into_owned()).map_err(|err| {
-        eprintln!("error: invalid riotfile path: {err}");
-        PyErr::new::<PySystemExit, _>(1)
-    })?;
+    let path_cstr = match CString::new(path.to_string_lossy().into_owned()) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("error: invalid riotfile path: {err}");
+            exit(1)
+        }
+    };
 
-    let module = PyModule::from_code(
+    let load_riot_module = || -> PyResult<()> {
+        let riot_module = PyModule::new(py, "riot")?;
+        riot_module.add_class::<PyVenv>()?;
+
+        let sys = py.import("sys")?;
+        let modules = sys.getattr("modules")?;
+        let modules: &Bound<'_, PyDict> = modules.cast()?;
+        modules.set_item("riot", riot_module)?;
+
+        Ok(())
+    };
+
+    if let Err(err) = load_riot_module() {
+        eprintln!("error: could not load the `riot` module in the interpreter: {err}");
+        exit(1);
+    }
+
+    let module = match PyModule::from_code(
         py,
         source_cstr.as_c_str(),
         path_cstr.as_c_str(),
         module_name.as_c_str(),
-    )?;
+    ) {
+        Ok(m) => m,
+        Err(err) => {
+            eprintln!("error: could not load riotfile.py in the python interpreter: {err}");
+            exit(1);
+        }
+    };
 
-    let venv_obj = module.getattr("venv").map_err(|_| missing_venv_err())?;
-    if venv_obj.is_none() {
-        return Err(missing_venv_err());
-    }
+    let Ok(venv_obj) = module.getattr("venv") else {
+        eprintln!("error: riotfile does not define a `venv` variable");
+        exit(1);
+    };
 
-    venv_obj.extract::<PyVenv>().map_err(PyErr::from)
+    let venv: PyVenv = match venv_obj.extract() {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("error: `venv` variable is invalid: {err}");
+            exit(1)
+        }
+    };
+    venv
 }
 
 /// Accept any of riot's `pys` shorthands (scalar, list, tuple, iterable) and normalise to strings.
@@ -693,28 +797,31 @@ where
         .collect()
 }
 
+/// Select execution contexts by hash or regex selector.
+///
+/// # Errors
+///
+/// Returns an error if the provided regex pattern is invalid.
+///
+/// # Panics
+///
+/// Panics if regex matching fails for a selected venv name.
 pub fn select_execution_contexts(
-    py: Python<'_>,
-    riotfile_path: &Path,
+    mut venvs: IndexMap<String, RiotVenv>,
     selector: Selector,
 ) -> PyResult<Vec<RiotVenv>> {
-    let root = load_riotfile(py, riotfile_path)?;
-    let project_path = riotfile_path.parent().unwrap();
-    let mut riot_venvs = normalize_venvs(py, &root, project_path);
-
     let (pattern_selector, python_selector) = match selector {
-        Selector::All => (String::new(), None),
         Selector::Pattern(pattern) => (pattern, None),
         Selector::Generic { python, pattern } => (pattern.unwrap_or_default(), python),
     };
 
     if let Some(python_selector) = python_selector {
-        riot_venvs.retain(|_, venv| python_selector.contains(&venv.python));
+        venvs.retain(|_, venv| python_selector.contains(&venv.python));
     }
-    let shared_pkgs_map = shared_pkgs_by_name(riot_venvs.values());
+    let shared_pkgs_map = shared_pkgs_by_name(venvs.values());
 
     if is_short_hash(&pattern_selector) {
-        let Some(mut venv) = riot_venvs.get(&pattern_selector).cloned() else {
+        let Some(mut venv) = venvs.get(&pattern_selector).cloned() else {
             return Ok(vec![]);
         };
         venv.shared_pkgs = shared_pkgs_map.get(&venv.name).cloned().unwrap_or_default();
@@ -722,7 +829,7 @@ pub fn select_execution_contexts(
     }
 
     if let Some(venv_hash) = parse_ctx_hash(&pattern_selector) {
-        let Some(mut venv) = riot_venvs.get(venv_hash).cloned() else {
+        let Some(mut venv) = venvs.get(venv_hash).cloned() else {
             return Ok(vec![]);
         };
 
@@ -741,7 +848,7 @@ pub fn select_execution_contexts(
 
     let mut selected_envs = Vec::new();
 
-    for (_, mut venv) in riot_venvs {
+    for (_, mut venv) in venvs {
         if name_regex.is_match(&venv.name).unwrap() {
             venv.shared_pkgs = shared_pkgs_map.get(&venv.name).cloned().unwrap_or_default();
             selected_envs.push(venv);

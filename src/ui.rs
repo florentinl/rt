@@ -18,6 +18,7 @@ pub fn blank_line() {
     eprintln!();
 }
 
+#[must_use] 
 pub fn format_pkgs(
     all_pkgs: &IndexMap<String, String>,
     shared_pkgs: &IndexMap<String, String>,
@@ -25,6 +26,7 @@ pub fn format_pkgs(
     format_unique_entries(all_pkgs, shared_pkgs, |key, val| format!("{key}{val} "))
 }
 
+#[must_use] 
 pub fn format_envs(
     all_envs: &IndexMap<String, String>,
     shared_envs: &IndexMap<String, String>,

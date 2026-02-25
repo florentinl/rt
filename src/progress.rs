@@ -60,12 +60,6 @@ pub struct StepContext {
     pub step_id: StepId,
 }
 
-impl StepContext {
-    pub fn append_output(&self, line: impl Into<String>) {
-        self.sink.append_output(&self.step_id, line.into());
-    }
-}
-
 /// Indicates how a logger wants command output to be delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputPolicy {
@@ -206,11 +200,10 @@ impl ProgressLogger for MultiplexedProgressLogger {
 
     fn flush_output(&self, id: &StepId) {
         let mut buffers = self.partial_lines.lock().unwrap();
-        if let Some(buffer) = buffers.remove(id) {
-            if !buffer.is_empty() {
+        if let Some(buffer) = buffers.remove(id)
+            && !buffer.is_empty() {
                 self.display.append_output(id.as_str(), buffer);
             }
-        }
     }
 
     fn output_policy(&self) -> OutputPolicy {

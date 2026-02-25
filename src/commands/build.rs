@@ -12,16 +12,16 @@ use crate::{
     command::ManagedCommand,
     config::Selector,
     progress::{
-        summarize_errors, MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger,
-        StepContext, StepId, StepOutcome, Task, TaskRunner,
+        MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
+        StepOutcome, Task, TaskRunner, summarize_errors,
     },
-    venv::{venv_path, ExecutionContext, RiotVenv},
+    venv::{ExecutionContext, RiotVenv, venv_path},
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
 use tempfile::{Builder, NamedTempFile};
 
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
+use pyo3::{PyErr, PyResult, exceptions::PySystemExit};
 use rayon::current_num_threads;
 
 use crate::{
@@ -31,17 +31,22 @@ use crate::{
 };
 
 /// Build the virtual environment for the provided execution context.
+///
+/// # Errors
+///
+/// Returns an error when context selection fails or any build step fails.
 pub fn run(
-    py: Python<'_>,
+    venvs: IndexMap<String, RiotVenv>,
     repo: &RepoConfig,
     selector: Selector,
     force_reinstall: bool,
 ) -> PyResult<()> {
-    let selected = select_execution_contexts(py, &repo.riotfile_path, selector)?;
+    let selected = select_execution_contexts(venvs, selector)?;
     build_selected_contexts(repo, &selected, force_reinstall)?;
     Ok(())
 }
 
+#[must_use]
 pub fn collect_context_indices(selected: &[RiotVenv]) -> Vec<(usize, usize)> {
     selected
         .iter()
@@ -56,6 +61,11 @@ pub fn collect_context_indices(selected: &[RiotVenv]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Build every selected execution context and its shared dependencies.
+///
+/// # Errors
+///
+/// Returns an error when the riot root cannot be prepared or any task fails.
 pub fn build_selected_contexts(
     repo: &RepoConfig,
     selected: &[RiotVenv],
@@ -81,7 +91,6 @@ pub fn build_selected_contexts(
         Arc::clone(&repo.build_env),
         Arc::clone(&repo.run_env),
         repo.riot_root.clone(),
-        repo.pytest_plugin_dir.clone(),
     ));
     let runner = TaskRunner::new(Arc::clone(&sink)).with_parallelism(Some(current_num_threads()));
 
@@ -158,23 +167,21 @@ pub struct BuildSharedState {
     build_env: Arc<HashMap<String, String>>,
     run_env: Arc<HashMap<String, String>>,
     riot_root: PathBuf,
-    pytest_plugin_dir: PathBuf,
 }
 
 impl BuildSharedState {
+    #[must_use]
     pub const fn new(
         force_reinstall: bool,
         build_env: Arc<HashMap<String, String>>,
         run_env: Arc<HashMap<String, String>>,
         riot_root: PathBuf,
-        pytest_plugin_dir: PathBuf,
     ) -> Self {
         Self {
             force_reinstall,
             build_env,
             run_env,
             riot_root,
-            pytest_plugin_dir,
         }
     }
 
@@ -193,6 +200,7 @@ impl BuildSharedState {
 
         let status = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
             .envs(self.build_env.as_ref())
+            .env("DD_FAST_BUILD", "1")
             .arg("install")
             .arg("-v")
             .arg("--system")
@@ -356,10 +364,6 @@ impl BuildSharedState {
             ));
         }
         paths.push((deps_install_path.to_string_lossy(), "riot dependencies"));
-        paths.push((
-            self.pytest_plugin_dir.to_string_lossy(),
-            "pytest plugin injected by rt",
-        ));
 
         {
             // pth file is mostly for analysis tools that do not execute sitecustomize.py to query site dirs
@@ -369,6 +373,17 @@ impl BuildSharedState {
                 .map(|(path, comment)| format!("# {comment}\n{path}"))
                 .join("\n");
             fs::write(pth_file, pth_content)?;
+        }
+
+        {
+            fs::write(
+                site_packages_path.join("pytest_rt.py"),
+                include_str!("../../pytest_rt/pytest_rt.py"),
+            )?;
+            fs::write(
+                site_packages_path.join("enable_pytest_rt.py"),
+                include_str!("../../pytest_rt/enable_pytest_rt.py"),
+            )?;
         }
 
         {
@@ -401,7 +416,10 @@ impl BuildSharedState {
             }
 
             writeln!(sitecustomize_content)?;
-            writeln!(sitecustomize_content, "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command")?;
+            writeln!(
+                sitecustomize_content,
+                "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command"
+            )?;
             writeln!(sitecustomize_content, "import enable_pytest_rt")?;
 
             let services_csv = services.join(",");

@@ -5,6 +5,10 @@ use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 use crate::{constants::VENV_PREFIX, ui};
 
 /// Remove virtual environments created under the riot root while keeping compiled requirements.
+///
+/// # Errors
+///
+/// Returns an error if directory traversal or removal fails.
 pub fn run(riot_root: &Path) -> PyResult<()> {
     ui::step(format!(
         "Cleaning virtual environments under {}",

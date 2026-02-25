@@ -1,8 +1,6 @@
 use std::{
-    env,
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     io::{self, BufReader, Read},
-    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::Arc,
     thread,
@@ -39,7 +37,9 @@ impl ManagedCommand {
 
     #[must_use]
     pub fn new_uv(subcommand: &str, sink: Arc<dyn ProgressLogger>, step_id: StepId) -> Self {
-        Self::new(resolve_uv_path(), step_id, sink)
+        let current_exe = std::env::current_exe().unwrap();
+        Self::new(current_exe, step_id, sink)
+            .env("RT_IS_UV_NOW", "true")
             .arg(subcommand)
             .arg("--no-config")
             .arg("--color=always")
@@ -85,20 +85,6 @@ impl ManagedCommand {
         V: AsRef<OsStr>,
     {
         self.command.envs(vars);
-        self
-    }
-
-    /// Set the working directory for the command.
-    #[must_use]
-    pub fn current_dir<P: AsRef<std::path::Path>>(mut self, dir: P) -> Self {
-        self.command.current_dir(dir);
-        self
-    }
-
-    /// Set stdin for the command.
-    #[must_use]
-    pub fn stdin(mut self, cfg: Stdio) -> Self {
-        self.command.stdin(cfg);
         self
     }
 
@@ -170,52 +156,5 @@ impl ManagedCommand {
 
             sink.flush_output(&step_id);
         })
-    }
-}
-
-fn resolve_uv_path() -> OsString {
-    if let Some(path) = env::var_os("RT_UV_PATH") {
-        if !path.is_empty() {
-            return path;
-        }
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Some(path) = uv_in_dir(dir) {
-                return path.into_os_string();
-            }
-        }
-    }
-
-    if let Some(venv) = env::var_os("VIRTUAL_ENV") {
-        let venv_dir = Path::new(&venv);
-        let candidate_dir = if cfg!(windows) {
-            venv_dir.join("Scripts")
-        } else {
-            venv_dir.join("bin")
-        };
-        if let Some(path) = uv_in_dir(&candidate_dir) {
-            return path.into_os_string();
-        }
-    }
-
-    OsString::from("uv")
-}
-
-fn uv_in_dir(dir: &Path) -> Option<PathBuf> {
-    let candidate = dir.join(uv_executable_name());
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-const fn uv_executable_name() -> &'static str {
-    if cfg!(windows) {
-        "uv.exe"
-    } else {
-        "uv"
     }
 }

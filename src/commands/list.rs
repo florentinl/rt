@@ -6,7 +6,7 @@ use serde_json::to_string_pretty;
 use crate::{
     config::{RepoConfig, Selector},
     ui,
-    venv::{select_execution_contexts, venv_path},
+    venv::{select_execution_contexts, venv_path, RiotVenv},
 };
 
 #[derive(Serialize)]
@@ -33,14 +33,19 @@ struct JsonVenv {
     execution_contexts: Vec<JsonExecutionContext>,
 }
 
+/// List selected virtual environments in tree, hash-only, or JSON format.
+///
+/// # Errors
+///
+/// Returns an error if context selection or JSON serialization fails.
 pub fn run(
-    py: Python<'_>,
+    venvs: IndexMap<String, RiotVenv>,
     repo: &RepoConfig,
     selector: Selector,
     hash_only: bool,
     json: bool,
 ) -> PyResult<()> {
-    let mut venvs = select_execution_contexts(py, &repo.riotfile_path, selector)?;
+    let mut venvs = select_execution_contexts(venvs, selector)?;
 
     venvs.retain(|v| !v.execution_contexts.is_empty());
 

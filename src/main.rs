@@ -1,22 +1,35 @@
-#![forbid(unsafe_code)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 #![allow(clippy::literal_string_with_formatting_args)]
 
-pub mod command;
+use std::{
+    env::args,
+    process::{ExitCode, exit},
+};
+
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
+use pyo3::Python;
+
+mod command;
 mod commands;
 mod completion;
 mod config;
 mod constants;
-pub mod display;
-pub mod progress;
+mod display;
+mod fake_ruamel_yaml;
+mod progress;
 mod ui;
 mod venv;
 
-use crate::config::{RepoConfig, RunConfig, Selector};
-use clap::{CommandFactory, Parser, Subcommand, ValueHint};
-use clap_complete::{engine::ArgValueCompleter, CompleteEnv};
+use crate::{
+    config::{RepoConfig, RunConfig, Selector, load_rt_toml},
+    venv::{RiotVenv, get_context},
+};
+use clap::{Subcommand, ValueHint};
+use clap_complete::engine::ArgValueCompleter;
+use indexmap::IndexMap;
 use pyo3::exceptions::PySystemExit;
 use pyo3::prelude::*;
 use std::path::{Path, PathBuf};
@@ -30,11 +43,11 @@ use std::path::{Path, PathBuf};
 struct Cli {
     /// Path to the riotfile to use. Falls back to discovery if omitted.
     #[arg(short, long, value_name = "PATH", add = ValueHint::FilePath)]
-    file: Option<PathBuf>,
+    pub file: Option<PathBuf>,
     #[arg(short, long, value_name = "PATH", add = ValueHint::DirPath)]
-    riot_root: Option<PathBuf>,
+    pub riot_root: Option<PathBuf>,
     #[command(subcommand)]
-    command: Commands,
+    pub command: Commands,
 }
 
 #[derive(Subcommand)]
@@ -174,7 +187,16 @@ enum VscodeCommands {
     Clear,
 }
 
-fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
+/// Dispatch the selected CLI command.
+///
+/// # Errors
+///
+/// Returns an error if command execution fails.
+fn run_command(
+    riot_venvs: IndexMap<String, RiotVenv>,
+    cli: Cli,
+    repo: &RepoConfig,
+) -> PyResult<()> {
     match cli.command {
         Commands::List {
             hash_only,
@@ -187,15 +209,15 @@ fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
                 return Err(PyErr::new::<PySystemExit, _>(2));
             }
             let selector = Selector::Generic { python, pattern };
-            commands::list::run(py, repo, selector, hash_only, json)
+            commands::list::run(riot_venvs, repo, selector, hash_only, json)
         }
-        Commands::Describe { hash } => commands::describe::run(py, repo, hash),
+        Commands::Describe { hash } => commands::describe::run(riot_venvs, repo, hash),
         Commands::Build {
             force_reinstall,
             pattern,
             python,
         } => commands::build::run(
-            py,
+            riot_venvs,
             repo,
             Selector::Generic { python, pattern },
             force_reinstall,
@@ -214,7 +236,7 @@ fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
                 action_label: "Execute".to_string(),
             };
             commands::run::run(
-                py,
+                riot_venvs,
                 repo,
                 Selector::Generic {
                     python,
@@ -228,39 +250,43 @@ fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
         Commands::Shell {
             hash,
             force_reinstall,
-        } => commands::shell::run(py, repo, &hash, force_reinstall),
+        } => commands::shell::run(riot_venvs, repo, &hash, force_reinstall),
         Commands::Activate {
             hash,
             force_reinstall,
-        } => commands::activate::run(py, repo, &hash, force_reinstall),
+        } => commands::activate::run(riot_venvs, repo, &hash, force_reinstall),
         Commands::Switch {
             hash,
             force_reinstall,
-        } => commands::switch::run(py, repo, &hash, force_reinstall),
+        } => commands::switch::run(riot_venvs, repo, &hash, force_reinstall),
         Commands::Clean => commands::clean::run(&repo.riot_root),
     }
 }
 
-fn locate_git_marker(dir: &Path) -> bool {
-    dir.join(".git").exists()
-}
+#[must_use]
+fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> PathBuf {
+    if let Some(path) = riotfile_arg {
+        if !path.is_file() {
+            eprintln!(
+                "error: specified riotfile {} does not exist.",
+                path.display()
+            );
+            exit(1);
+        }
+        return path.to_owned();
+    }
 
-fn locate_riotfile(start_dir: Option<PathBuf>) -> Option<PathBuf> {
-    let mut dir = match start_dir {
-        Some(path) => path,
-        None => match std::env::current_dir() {
-            Ok(path) => path,
-            Err(_) => return None,
-        },
+    let Ok(mut dir) = std::env::current_dir() else {
+        exit(1);
     };
 
     loop {
         let candidate = dir.join("riotfile.py");
         if candidate.is_file() {
-            return Some(candidate);
+            return candidate;
         }
 
-        if locate_git_marker(&dir) {
+        if dir.join(".git").is_dir() {
             break;
         }
 
@@ -268,133 +294,56 @@ fn locate_riotfile(start_dir: Option<PathBuf>) -> Option<PathBuf> {
             break;
         }
     }
-
-    None
-}
-
-fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = riot_root_path {
-        path.parent()?.exists().then_some(path.clone())
-    } else {
-        riotfile_path
-            .parent()
-            .and_then(|parent| parent.exists().then_some(parent.join(".riot")))
-    }
-}
-
-fn prepare_cli_args(py: Python<'_>) -> PyResult<Vec<String>> {
-    let sys = py.import("sys")?;
-    let argv: Vec<String> = sys.getattr("argv")?.extract()?;
-
-    let mut filtered_args = Vec::with_capacity(argv.len().max(1));
-    filtered_args.push("rt".to_string());
-
-    let mut skip_next = false;
-    for (idx, arg) in argv.into_iter().enumerate() {
-        if idx == 0 {
-            // argv[0] is either the script path or python executable - omit.
-            continue;
-        }
-
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        if arg == "-m" {
-            // Skip the module selector and the following module name.
-            skip_next = true;
-            continue;
-        }
-
-        if filtered_args.len() == 1 {
-            let path = Path::new(&arg);
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                if name.starts_with("python") || name == "rt" {
-                    continue;
-                }
-            }
-        }
-
-        filtered_args.push(arg);
-    }
-
-    Ok(filtered_args)
-}
-
-fn missing_riotfile_error() -> PyErr {
     eprintln!(
         "error: riotfile.py not found in the current workspace (searched up to the git repository root)."
     );
-    PyErr::new::<PySystemExit, _>(1)
+    exit(1);
 }
 
-fn locate_pytest_plugin_dir(py: Python<'_>) -> Option<PathBuf> {
-    let module = py.import(crate::constants::PYTEST_PLUGIN_MODULE).ok()?;
-    let file_attr = module.getattr("__file__").ok()?;
-    let file_path: PathBuf = file_attr.extract().ok()?;
-    Some(file_path.parent()?.to_path_buf())
+#[must_use]
+fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> PathBuf {
+    let path = riot_root_path.map_or_else(
+        || {
+            riotfile_path
+                .parent()
+                .and_then(|parent| parent.exists().then_some(parent.join(".riot")))
+        },
+        |path| {
+            path.parent()
+                .is_some_and(Path::exists)
+                .then_some(path.clone())
+        },
+    );
+
+    let Some(path) = path else {
+        eprintln!("error: could not create riot root directory");
+        exit(1);
+    };
+    path
 }
 
-/// Entry point used by the Python console-script proxy.
-#[pyfunction]
-fn run_cli(py: Python<'_>) -> PyResult<()> {
-    let cli_args = prepare_cli_args(py)?;
-    completion::prepare(py);
-
-    let current_dir = std::env::current_dir().ok();
-
-    if CompleteEnv::with_factory(Cli::command)
-        .try_complete(&cli_args, current_dir.as_deref())
-        .map_err(|err| {
-            eprintln!("error: failed to complete: {err}");
-            PyErr::new::<PySystemExit, _>(1)
-        })?
+fn main() -> ExitCode {
+    if let Ok(value) = std::env::var("RT_IS_UV_NOW")
+        && value == "true"
     {
-        return Ok(());
+        return unsafe { uv::main(args()) };
     }
 
-    let cli = Cli::try_parse_from(cli_args).map_err(|err| {
-        let _ = err.print();
-        PyErr::new::<PySystemExit, _>(err.exit_code())
-    })?;
+    CompleteEnv::with_factory(Cli::command).complete();
 
-    let riotfile_path = if let Some(path) = &cli.file {
-        if !path.is_file() {
-            eprintln!(
-                "error: specified riotfile {} does not exist.",
-                path.display()
-            );
-            return Err(PyErr::new::<PySystemExit, _>(1));
-        }
-        path.to_owned()
-    } else if let Some(path) = locate_riotfile(None) {
-        path
-    } else {
-        return Err(missing_riotfile_error());
-    };
+    let cli = Cli::parse();
 
-    let Some(riot_root) = locate_riotroot(&riotfile_path, cli.riot_root.as_ref()) else {
-        eprintln!("error: could not create riot root directory");
-        return Err(PyErr::new::<PySystemExit, _>(1));
-    };
+    let riotfile_path = locate_riotfile(cli.file.as_ref());
+    let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref());
 
-    let pytest_plugin_dir = locate_pytest_plugin_dir(py);
-    let Some(pytest_plugin_dir) = pytest_plugin_dir else {
-        eprintln!("error: rt pytest plugin could not be located; aborting.");
-        return Err(PyErr::new::<PySystemExit, _>(1));
-    };
+    Python::initialize();
+    let riot_venvs = Python::attach(|py| get_context(py, &riotfile_path));
 
-    let repo_config = RepoConfig::load(riotfile_path, riot_root, pytest_plugin_dir)?;
+    let (build_env, run_env) = load_rt_toml(&riotfile_path);
+    let repo_config = RepoConfig::load(riotfile_path, riot_root, build_env, run_env);
 
-    run_command(py, cli, &repo_config)
-}
-
-/// A Python module implemented in Rust.
-#[pymodule]
-fn riot(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(run_cli, m)?)?;
-    m.add_class::<venv::PyVenv>()?;
-
-    Ok(())
+    if run_command(riot_venvs, cli, &repo_config).is_err() {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }

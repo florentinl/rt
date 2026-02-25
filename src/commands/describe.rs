@@ -2,15 +2,20 @@ use std::path::Path;
 
 use crossterm::style::{Attribute, Color, Stylize};
 use indexmap::IndexMap;
-use pyo3::{PyResult, Python};
+use pyo3::PyResult;
 
 use crate::{
     config::{RepoConfig, Selector},
     venv::{select_execution_contexts, venv_path, RiotVenv},
 };
 
-pub fn run(py: Python<'_>, repo: &RepoConfig, hash: String) -> PyResult<()> {
-    let selected = select_execution_contexts(py, &repo.riotfile_path, Selector::Pattern(hash))?;
+/// Print a detailed description of the selected virtual environments.
+///
+/// # Errors
+///
+/// Returns an error if context selection fails.
+pub fn run(venvs: IndexMap<String, RiotVenv>, repo: &RepoConfig, hash: String) -> PyResult<()> {
+    let selected = select_execution_contexts(venvs, Selector::Pattern(hash))?;
 
     for venv in selected {
         describe_venv(repo, &venv);

@@ -1,53 +1,20 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::collections::{HashMap, HashSet};
 
 use clap::builder::StyledStr;
 use clap_complete::{engine::ValueCompleter, CompletionCandidate};
+use indexmap::IndexMap;
 use pyo3::Python;
 
 use crate::{
     config::Selector,
     locate_riotfile,
     ui::{format_envs, format_pkgs},
-    venv::{compare_python_versions, select_execution_contexts, RiotVenv},
+    venv::{compare_python_versions, get_context, select_execution_contexts, RiotVenv},
 };
 
-struct CompletionData {
-    riotfile: PathBuf,
-    venvs: Vec<RiotVenv>,
-}
-
-static COMPLETION_DATA: OnceLock<CompletionData> = OnceLock::new();
-
-fn completion_data() -> Option<&'static CompletionData> {
-    COMPLETION_DATA.get()
-}
-
-fn select_contexts(pattern: &str, data: &CompletionData) -> Vec<RiotVenv> {
-    Python::attach(|py| {
-        select_execution_contexts(py, &data.riotfile, Selector::Pattern(pattern.to_string()))
-    })
-    .unwrap_or_default()
-}
-
-fn completion_requested() -> bool {
-    std::env::var_os("COMPLETE").is_some_and(|value| !value.is_empty() && value != "0")
-}
-
-pub fn prepare(py: Python<'_>) {
-    if completion_data().is_some() || !completion_requested() {
-        return;
-    }
-    let Some(riotfile) = locate_riotfile(None) else {
-        return;
-    };
-
-    let venvs = select_execution_contexts(py, &riotfile, Selector::All).unwrap_or_default();
-
-    let _ = COMPLETION_DATA.set(CompletionData { riotfile, venvs });
+pub fn get_venvs() -> IndexMap<String, RiotVenv> {
+    Python::initialize();
+    Python::attach(|py| get_context(py, &locate_riotfile(None)))
 }
 
 pub struct PythonCompleter;
@@ -58,13 +25,10 @@ impl ValueCompleter for PythonCompleter {
             return vec![];
         };
 
-        let Some(data) = completion_data() else {
-            return vec![];
-        };
-
         let mut python_version: HashSet<&String> = HashSet::new();
 
-        for venv in &data.venvs {
+        let venvs = get_venvs();
+        for (_, venv) in &venvs {
             if venv.python.starts_with(hint) {
                 python_version.insert(&venv.python);
             }
@@ -88,11 +52,9 @@ impl ValueCompleter for NameCompleter {
             return vec![];
         };
 
-        let Some(data) = completion_data() else {
-            return vec![];
-        };
-
-        let selected_venvs = select_contexts(current, data);
+        let selected_venvs =
+            select_execution_contexts(get_venvs(), Selector::Pattern(current.to_string()))
+                .unwrap_or_default();
 
         let mut venv_names = HashSet::new();
 
@@ -112,11 +74,8 @@ fn complete_selector(current: &std::ffi::OsStr, with_names: bool) -> Vec<Complet
         return vec![];
     };
 
-    let Some(data) = completion_data() else {
-        return vec![];
-    };
-
-    let selected = select_contexts(hint, data);
+    let selected = select_execution_contexts(get_venvs(), Selector::Pattern(hint.to_string()))
+        .unwrap_or_default();
 
     let mut candidates: HashMap<String, CompletionCandidate> = HashMap::new();
 

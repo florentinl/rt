@@ -1,6 +1,7 @@
 use std::{io::IsTerminal, sync::Arc};
 
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
+use indexmap::IndexMap;
+use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 
 use crate::{
     command::ManagedCommand,
@@ -13,15 +14,19 @@ use crate::{
     venv::{select_execution_contexts, venv_python_path, ExecutionContext, RiotVenv},
 };
 /// Build and execute the command for the given execution context.
+///
+/// # Errors
+///
+/// Returns an error if context selection, build, or command execution fails.
 pub fn run(
-    py: Python<'_>,
+    venvs: IndexMap<String, RiotVenv>,
     repo: &RepoConfig,
     selector: Selector,
     force_reinstall: bool,
     parallel: Option<usize>,
     run_config: &RunConfig,
 ) -> PyResult<()> {
-    let selected = select_execution_contexts(py, &repo.riotfile_path, selector)?;
+    let selected = select_execution_contexts(venvs, selector)?;
 
     for selected_venv in &selected {
         for exc_ctx in &selected_venv.execution_contexts {

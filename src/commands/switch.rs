@@ -1,17 +1,27 @@
 use std::fs;
 
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult, Python};
+use indexmap::IndexMap;
+use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 use std::os::unix::fs::symlink;
 
 use crate::{
     commands::{build::build_selected_contexts, shell::resolve_target},
     config::RepoConfig,
-    venv,
+    venv::{self, RiotVenv},
 };
 
 /// Build the requested environment and link it as `.venv` in the riotfile directory.
-pub fn run(py: Python<'_>, repo: &RepoConfig, hash: &str, force_reinstall: bool) -> PyResult<()> {
-    let target = resolve_target(py, &repo.riotfile_path, hash)?;
+///
+/// # Errors
+///
+/// Returns an error if target resolution, build, or link replacement fails.
+pub fn run(
+    venvs: IndexMap<String, RiotVenv>,
+    repo: &RepoConfig,
+    hash: &str,
+    force_reinstall: bool,
+) -> PyResult<()> {
+    let target = resolve_target(venvs, hash)?;
     let ctx_hash = &target.execution_contexts[0].hash;
 
     build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall)?;

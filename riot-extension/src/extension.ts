@@ -4,7 +4,6 @@ import { getEnvExtApi } from "./pythonEnvsApi";
 import { RiotEnvManager } from "./riotEnvManager";
 import { RiotPackageManager } from "./riotPackageManager";
 import { VenvIndicatorService } from "./services/venvIndicatorService";
-import { patchPythonEnvironment } from "./patchBundledPython";
 import { registerCommands } from "./commands";
 
 // This method is called when your extension is activated
@@ -18,14 +17,11 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(log);
 
   log.appendLine("Riot Environment Manager activating...");
-
-  patchPythonEnvironment(context.extension.extensionPath, log);
-
   const envManager = new RiotEnvManager(
     log,
     extensionId,
     context.workspaceState,
-    path.join(context.extensionPath, "python/bin/rt"),
+    path.join(context.extensionPath, "rt"),
   );
   context.subscriptions.push(api.registerEnvironmentManager(envManager));
 
