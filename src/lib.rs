@@ -16,7 +16,6 @@ mod venv;
 
 use crate::config::{RepoConfig, RunConfig, Selector};
 use clap::{CommandFactory, Parser, Subcommand, ValueHint};
-use clap_complete::Shell;
 use clap_complete::{engine::ArgValueCompleter, CompleteEnv};
 use pyo3::exceptions::PySystemExit;
 use pyo3::prelude::*;
@@ -72,11 +71,6 @@ enum Commands {
             add = ArgValueCompleter::new(completion::HashCompleter)
         )]
         hash: String,
-    },
-    /// Completions
-    Completions {
-        #[arg(value_name = "SHELL")]
-        shell: Shell,
     },
     /// Build the virtual environment for execution contexts matched by the selector.
     Build {
@@ -244,7 +238,6 @@ fn run_command(py: Python<'_>, cli: Cli, repo: &RepoConfig) -> PyResult<()> {
             force_reinstall,
         } => commands::switch::run(py, repo, &hash, force_reinstall),
         Commands::Clean => commands::clean::run(&repo.riot_root),
-        Commands::Completions { .. } => unreachable!(),
     }
 }
 
@@ -365,11 +358,6 @@ fn run_cli(py: Python<'_>) -> PyResult<()> {
         let _ = err.print();
         PyErr::new::<PySystemExit, _>(err.exit_code())
     })?;
-
-    if let Commands::Completions { shell } = cli.command {
-        commands::completion::run(shell)?;
-        return Ok(());
-    }
 
     let riotfile_path = if let Some(path) = &cli.file {
         if !path.is_file() {

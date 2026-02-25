@@ -400,7 +400,7 @@ impl BuildSharedState {
                 }
             }
 
-            writeln!(sitecustomize_content, "")?;
+            writeln!(sitecustomize_content)?;
             writeln!(sitecustomize_content, "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command")?;
             writeln!(sitecustomize_content, "import enable_pytest_rt")?;
 

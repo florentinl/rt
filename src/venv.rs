@@ -18,7 +18,7 @@ use crate::config::Selector;
 use crate::constants::VENV_PREFIX;
 
 #[derive(Clone)]
-#[pyclass(name = "Venv", module = "riot")]
+#[pyclass(from_py_object, name = "Venv", module = "riot")]
 pub struct PyVenv {
     pub name: Option<String>,
     pub command: Option<String>,
