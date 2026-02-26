@@ -6,6 +6,8 @@ edition = "2024"
 [profile.release]
 strip = true
 lto = "fat"
+panic = "abort"
+codegen-units = 1
 
 [dependencies]
 uv = { version = "0.10.6", default-features = false, features = [

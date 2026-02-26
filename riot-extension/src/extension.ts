@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getEnvExtApi } from "./pythonEnvsApi";
@@ -6,10 +7,57 @@ import { RiotPackageManager } from "./riotPackageManager";
 import { VenvIndicatorService } from "./services/venvIndicatorService";
 import { registerCommands } from "./commands";
 
+function resolveBundledRtPath(context: vscode.ExtensionContext): string {
+  const platformBinary = process.platform === "win32" ? "rt.exe" : "rt";
+  const platformBinaryPath = path.join(context.extensionPath, platformBinary);
+  if (fs.existsSync(platformBinaryPath)) {
+    return platformBinaryPath;
+  }
+  return "rt";
+}
+
+function ensureRtInPath(
+  context: vscode.ExtensionContext,
+  rtPath: string,
+  log: vscode.LogOutputChannel,
+): void {
+  const rtDir = path.dirname(rtPath);
+  const delimiter = path.delimiter;
+  const pathKey =
+    Object.keys(process.env).find((key) => key.toLowerCase() === "path") ??
+    "PATH";
+  const currentPath = process.env[pathKey] ?? "";
+  const hasRtDir = currentPath
+    .split(delimiter)
+    .some((entry) =>
+      process.platform === "win32"
+        ? entry.toLowerCase() === rtDir.toLowerCase()
+        : entry === rtDir,
+    );
+
+  if (!hasRtDir) {
+    process.env[pathKey] = currentPath
+      ? `${rtDir}${delimiter}${currentPath}`
+      : rtDir;
+    log.appendLine(`[riot] Added ${rtDir} to extension host ${pathKey}.`);
+  }
+
+  const mutator = `${rtDir}${delimiter}`;
+  context.environmentVariableCollection.persistent = false;
+  context.environmentVariableCollection.prepend("PATH", mutator);
+  if (process.platform === "win32") {
+    context.environmentVariableCollection.prepend("Path", mutator);
+  }
+  context.environmentVariableCollection.description =
+    "Expose bundled rt binary in terminal PATH";
+  log.appendLine("[riot] Added bundled rt binary to terminal PATH.");
+}
+
 // This method is called when your extension is activated
 export async function activate(context: vscode.ExtensionContext) {
   const api = await getEnvExtApi();
   const extensionId = context.extension.id;
+  const rtPath = resolveBundledRtPath(context);
 
   const log = vscode.window.createOutputChannel("Riot Environment Manager", {
     log: true,
@@ -17,11 +65,12 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(log);
 
   log.appendLine("Riot Environment Manager activating...");
+  ensureRtInPath(context, rtPath, log);
   const envManager = new RiotEnvManager(
     log,
     extensionId,
     context.workspaceState,
-    path.join(context.extensionPath, "rt"),
+    rtPath,
   );
   context.subscriptions.push(api.registerEnvironmentManager(envManager));
 

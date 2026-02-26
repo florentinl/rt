@@ -217,6 +217,13 @@ export interface PythonEnvironmentInfo {
    * Optional `group` for this environment. This is used to group environments in the Environment Manager UI.
    */
   readonly group?: string | EnvironmentGroupInfo;
+
+  /**
+   * Error message if the environment is broken or invalid.
+   * When set, indicates this environment has issues (e.g., broken symlinks, missing Python executable).
+   * The UI should display a warning indicator and show this message to help users diagnose and fix the issue.
+   */
+  readonly error?: string;
 }
 
 /**

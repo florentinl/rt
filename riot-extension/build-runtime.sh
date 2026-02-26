@@ -2,6 +2,6 @@
 set -euo pipefail
 
 cd ..
-cargo build --release --target-dir .
+cargo build --release
 
 cp target/release/rt riot-extension/rt

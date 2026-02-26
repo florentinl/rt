@@ -3,6 +3,7 @@
  * Coordinates environment discovery, management, and lifecycle
  */
 
+import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import {
@@ -46,6 +47,7 @@ export class RiotEnvManager implements EnvironmentManager {
   private readonly statePersistence: StatePersistenceService;
   private readonly formatter: EnvironmentDisplayFormatter;
   private readonly currentEnvironment = new Map<string, PythonEnvironment>();
+  private readonly knownEnvironments = new Map<string, PythonEnvironment[]>();
   private readonly ongoingActivations = new Map<string, AbortController>();
 
   private readonly envsEmitter =
@@ -79,10 +81,30 @@ export class RiotEnvManager implements EnvironmentManager {
       return;
     }
 
-    const previous = await this.fetchEnvironmentsForFolders(folders);
-    const next = await this.fetchEnvironmentsForFolders(folders);
+    const changes: DidChangeEnvironmentsEventArgs = [];
+    for (const folder of folders) {
+      const cwd = folder.fsPath;
+      const previous = this.knownEnvironments.get(cwd) ?? [];
+      const next = await this.fetchEnvironments(cwd);
+      this.knownEnvironments.set(cwd, next);
+      changes.push(...this.computeChanges(previous, next));
 
-    const changes = this.computeChanges(previous, next);
+      const current = this.currentEnvironment.get(cwd);
+      if (!current) {
+        continue;
+      }
+
+      const updated = next.find((env) => env.envId.id === current.envId.id);
+      if (updated && this.environmentExecutableExists(updated)) {
+        this.currentEnvironment.set(cwd, updated);
+        continue;
+      }
+
+      await this.statePersistence.saveLastEnvironment(cwd, undefined);
+      this.currentEnvironment.delete(cwd);
+      this.envEmitter.fire({ uri: folder, old: current, new: undefined });
+    }
+
     if (changes.length > 0) {
       this.envsEmitter.fire(changes);
     }
@@ -143,10 +165,11 @@ export class RiotEnvManager implements EnvironmentManager {
 
     const cwd = folder.fsPath;
     const current = this.currentEnvironment.get(cwd);
-    if (current) {
+    if (current && this.environmentExecutableExists(current)) {
       return current;
     }
 
+    this.currentEnvironment.delete(cwd);
     return this.restoreEnvironment(cwd);
   }
 
@@ -179,6 +202,7 @@ export class RiotEnvManager implements EnvironmentManager {
 
   async clearCache?(): Promise<void> {
     this.currentEnvironment.clear();
+    this.knownEnvironments.clear();
   }
 
   /**
@@ -242,13 +266,7 @@ export class RiotEnvManager implements EnvironmentManager {
   /**
    * Get venv by hash (for package manager)
    */
-  async getVenvByHash(hash: string, cwd?: string): Promise<RtVenv | undefined> {
-    if (cwd) {
-      const venvs = await this.cliService.listEnvironments(cwd);
-      return this.findVenvByHash(venvs, hash);
-    }
-
-    // Search all workspaces
+  async getVenvByHash(hash: string): Promise<RtVenv | undefined> {
     const folders = this.workspaceResolver.getWorkspaceFolders();
     for (const folder of folders) {
       const venvs = await this.cliService.listEnvironments(folder.fsPath);
@@ -287,6 +305,7 @@ export class RiotEnvManager implements EnvironmentManager {
       displayPath,
       version: venv.python,
       environmentPath: vscode.Uri.file(ctx.venv_path),
+      tooltip: `Environment hash: ${ctx.hash}`,
       execInfo: {
         run: { executable: pythonPath },
         activatedRun: { executable: pythonPath },
@@ -370,23 +389,41 @@ export class RiotEnvManager implements EnvironmentManager {
             signal: controller.signal,
           });
 
-          progress.report({ message: "Updating test configuration" });
+          progress.report({ message: "Loading built environment" });
           const venvs = await this.cliService.listEnvironments(cwd);
           const venv = this.findVenvByHash(venvs, environment.envId.id);
+          if (!venv) {
+            throw new Error(
+              `Environment ${environment.envId.id} not found after build`,
+            );
+          }
           const ctx = venv?.execution_contexts.find(
             (c) => c.hash === environment.envId.id,
           );
+          if (!ctx) {
+            throw new Error(
+              `Execution context ${environment.envId.id} not found after build`,
+            );
+          }
+          const activated = this.buildEnvironment(venv, ctx, cwd);
+          if (!this.environmentExecutableExists(activated)) {
+            throw new Error(
+              `Environment interpreter not found: ${activated.execInfo.run.executable}`,
+            );
+          }
+
+          progress.report({ message: "Updating test configuration" });
           await this.testingConfigManager.updateConfiguration(folder, ctx);
 
-          this.currentEnvironment.set(cwd, environment);
+          this.currentEnvironment.set(cwd, activated);
           await this.statePersistence.saveLastEnvironment(
             cwd,
-            environment.envId.id,
+            activated.envId.id,
           );
           this.envEmitter.fire({
             uri: folder,
             old: previous,
-            new: environment,
+            new: activated,
           });
         },
       );
@@ -414,16 +451,26 @@ export class RiotEnvManager implements EnvironmentManager {
       return undefined;
     }
 
-    const envs = await this.fetchEnvironments(cwd);
-    const restored = envs.find((env) => env.envId.id === savedEnvId);
-
-    if (restored) {
-      this.currentEnvironment.set(cwd, restored);
-    } else {
-      // Environment no longer exists, clear saved state
+    try {
+      await this.cliService.buildEnvironment(savedEnvId, cwd);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log?.warn(`Failed to restore environment ${savedEnvId}: ${message}`);
       await this.statePersistence.saveLastEnvironment(cwd, undefined);
+      this.currentEnvironment.delete(cwd);
+      return undefined;
     }
 
+    const restored = await this.findEnvironmentById(cwd, savedEnvId);
+
+    if (!restored || !this.environmentExecutableExists(restored)) {
+      this.log?.warn(`Restored environment ${savedEnvId} is not usable`);
+      await this.statePersistence.saveLastEnvironment(cwd, undefined);
+      this.currentEnvironment.delete(cwd);
+      return undefined;
+    }
+
+    this.currentEnvironment.set(cwd, restored);
     return restored;
   }
 
@@ -471,6 +518,18 @@ export class RiotEnvManager implements EnvironmentManager {
       }
     }
     return undefined;
+  }
+
+  private async findEnvironmentById(
+    cwd: string,
+    envId: string,
+  ): Promise<PythonEnvironment | undefined> {
+    const envs = await this.fetchEnvironments(cwd);
+    return envs.find((env) => env.envId.id === envId);
+  }
+
+  private environmentExecutableExists(environment: PythonEnvironment): boolean {
+    return fs.existsSync(environment.execInfo.run.executable);
   }
 
   private matchesPath(env: PythonEnvironment, targetPath: string): boolean {

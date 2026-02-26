@@ -50,29 +50,22 @@ export class RiotPackageManager implements PackageManager {
   async getPackages(
     environment: PythonEnvironment,
   ): Promise<Package[] | undefined> {
-    try {
-      const venvHash = environment.envId.id;
-      const cwd = environment.environmentPath.fsPath;
-      const venv = await this.envManager.getVenvByHash(venvHash, cwd);
-      if (!venv) {
-        return [];
-      }
-
-      return Object.entries(venv.pkgs).map(([name, version]) => ({
-        name,
-        displayName: name,
-        version,
-        pkgId: {
-          id: `${name}${version ?? ""}`,
-          managerId: this.managerId,
-          environmentId: venvHash,
-        },
-      }));
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log?.appendLine(`[riot] Failed to list packages: ${msg}`);
+    const venvHash = environment.envId.id;
+    const venv = await this.envManager.getVenvByHash(venvHash);
+    if (!venv) {
       return [];
     }
+
+    return Object.entries(venv.pkgs).map(([name, version]) => ({
+      name,
+      displayName: name,
+      version,
+      pkgId: {
+        id: `${name}${version ?? ""}`,
+        managerId: this.managerId,
+        environmentId: venvHash,
+      },
+    }));
   }
 
   clearCache?(): Promise<void> {
