@@ -337,6 +337,9 @@ fn main() -> ExitCode {
     let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref());
 
     Python::initialize();
+    Python::attach(|py| {
+        py.import("gc").unwrap().call_method0("disable").unwrap();
+    });
     let riot_venvs = Python::attach(|py| get_context(py, &riotfile_path));
 
     let (build_env, run_env) = load_rt_toml(&riotfile_path);

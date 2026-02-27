@@ -2,6 +2,6 @@
 set -euo pipefail
 
 cd ..
-cargo build --release
+cargo build --profile final
 
-cp target/release/rt riot-extension/rt
+cp target/final/rt riot-extension/rt
