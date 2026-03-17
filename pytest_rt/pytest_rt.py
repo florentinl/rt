@@ -48,11 +48,14 @@ with suppress(Exception):
             return True
         return owner_pid == str(os.getpid())
 
+    def _should_manage_services(session) -> bool:
+        return not bool(getattr(session.config.option, "collectonly", False))
+
     def pytest_sessionstart(session):
         if not _is_entrypoint():
             return
         suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
-        if suitespec_services != "":
+        if suitespec_services != "" and _should_manage_services(session):
             print("=== starting services ===")
             project_root = os.getenv("RIOT_PROJECT_ROOT", "")
             services = suitespec_services.split(",")
@@ -86,7 +89,7 @@ with suppress(Exception):
         if not _is_entrypoint():
             return
         suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
-        if suitespec_services == "":
+        if suitespec_services == "" or not _should_manage_services(session):
             return
         project_root = os.getenv("RIOT_PROJECT_ROOT", "")
         services = suitespec_services.split(",")
