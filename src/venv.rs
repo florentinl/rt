@@ -633,16 +633,36 @@ fn parse_pytest_target(command: &str) -> Option<String> {
             continue;
         }
 
-        let candidate = PathBuf::from(token);
+        let Some(path_token) = token.split("::").next() else {
+            continue;
+        };
+        let candidate = PathBuf::from(path_token);
 
         if (candidate.is_dir() || candidate.extension().is_some_and(|ext| ext == "py"))
             && candidate.exists()
         {
-            return Some(candidate.to_string_lossy().to_string());
+            return Some(token.to_string());
         }
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pytest_target;
+
+    #[test]
+    fn parse_pytest_target_keeps_pytest_node_id() {
+        let target = parse_pytest_target(
+            "pytest tests/data/simple_riotfile.py::Test_Django {cmdargs}",
+        );
+
+        assert_eq!(
+            target.as_deref(),
+            Some("tests/data/simple_riotfile.py::Test_Django"),
+        );
+    }
 }
 
 fn load_riotfile(py: Python<'_>, path: &Path) -> PyVenv {
