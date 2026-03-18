@@ -3,36 +3,35 @@
 #![warn(clippy::nursery)]
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::{
-    env::args,
-    process::{ExitCode, exit},
-};
+use std::{env::args, process::ExitCode};
 
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use pyo3::Python;
 
 mod command;
 mod commands;
 mod completion;
 mod config;
+mod config_provider;
 mod constants;
 mod display;
-mod fake_ruamel_yaml;
+mod error;
 mod progress;
 mod ui;
 mod venv;
 
 use crate::{
     config::{RepoConfig, RunConfig, Selector, load_rt_toml},
-    venv::{RiotVenv, get_context},
+    config_provider::Pyo3ConfigProvider,
+    error::{RtError, RtResult},
+    venv::{RiotVenv, load_context},
 };
 use clap::{Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
-use pyo3::exceptions::PySystemExit;
-use pyo3::prelude::*;
 use std::path::{Path, PathBuf};
+
+type DefaultConfigProvider = Pyo3ConfigProvider;
 
 #[derive(Parser)]
 #[command(
@@ -196,7 +195,7 @@ fn run_command(
     riot_venvs: IndexMap<String, RiotVenv>,
     cli: Cli,
     repo: &RepoConfig,
-) -> PyResult<()> {
+) -> RtResult<()> {
     match cli.command {
         Commands::List {
             hash_only,
@@ -205,8 +204,10 @@ fn run_command(
             python,
         } => {
             if hash_only && json {
-                eprintln!("error: --hash-only and --json cannot be used together.");
-                return Err(PyErr::new::<PySystemExit, _>(2));
+                return Err(RtError::with_code(
+                    2,
+                    "error: --hash-only and --json cannot be used together.",
+                ));
             }
             let selector = Selector::Generic { python, pattern };
             commands::list::run(riot_venvs, repo, selector, hash_only, json)
@@ -263,27 +264,27 @@ fn run_command(
     }
 }
 
-#[must_use]
-fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> PathBuf {
+fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> RtResult<PathBuf> {
     if let Some(path) = riotfile_arg {
         if !path.is_file() {
-            eprintln!(
+            return Err(RtError::message(format!(
                 "error: specified riotfile {} does not exist.",
                 path.display()
-            );
-            exit(1);
+            )));
         }
-        return path.to_owned();
+        return Ok(path.to_owned());
     }
 
-    let Ok(mut dir) = std::env::current_dir() else {
-        exit(1);
-    };
+    let mut dir = std::env::current_dir().map_err(|err| {
+        RtError::message(format!(
+            "error: failed to determine current directory: {err}"
+        ))
+    })?;
 
     loop {
         let candidate = dir.join("riotfile.py");
         if candidate.is_file() {
-            return candidate;
+            return Ok(candidate);
         }
 
         if dir.join(".git").is_dir() {
@@ -294,14 +295,13 @@ fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> PathBuf {
             break;
         }
     }
-    eprintln!(
-        "error: riotfile.py not found in the current workspace (searched up to the git repository root)."
-    );
-    exit(1);
+
+    Err(RtError::message(
+        "error: riotfile.py not found in the current workspace (searched up to the git repository root).",
+    ))
 }
 
-#[must_use]
-fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> PathBuf {
+fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> RtResult<PathBuf> {
     let path = riot_root_path.map_or_else(
         || {
             riotfile_path
@@ -315,11 +315,7 @@ fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> Pa
         },
     );
 
-    let Some(path) = path else {
-        eprintln!("error: could not create riot root directory");
-        exit(1);
-    };
-    path
+    path.ok_or_else(|| RtError::message("error: could not create riot root directory"))
 }
 
 fn main() -> ExitCode {
@@ -331,22 +327,23 @@ fn main() -> ExitCode {
 
     CompleteEnv::with_factory(Cli::command).complete();
 
+    if let Err(err) = try_main() {
+        err.report();
+        return ExitCode::from(err.exit_code());
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn try_main() -> RtResult<()> {
     let cli = Cli::parse();
 
-    let riotfile_path = locate_riotfile(cli.file.as_ref());
-    let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref());
+    let riotfile_path = locate_riotfile(cli.file.as_ref())?;
+    let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
+    let riot_venvs = load_context::<DefaultConfigProvider>(&riotfile_path)?;
 
-    Python::initialize();
-    Python::attach(|py| {
-        py.import("gc").unwrap().call_method0("disable").unwrap();
-    });
-    let riot_venvs = Python::attach(|py| get_context(py, &riotfile_path));
-
-    let (build_env, run_env) = load_rt_toml(&riotfile_path);
+    let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
     let repo_config = RepoConfig::load(riotfile_path, riot_root, build_env, run_env);
 
-    if run_command(riot_venvs, cli, &repo_config).is_err() {
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
+    run_command(riot_venvs, cli, &repo_config)
 }

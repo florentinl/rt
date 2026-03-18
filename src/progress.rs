@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rayon::{iter::IntoParallelIterator, iter::ParallelIterator, ThreadPoolBuilder};
+use rayon::{ThreadPoolBuilder, iter::IntoParallelIterator, iter::ParallelIterator};
 
 use crate::{
     display::{DisplayManager, StepStatus},
@@ -201,9 +201,10 @@ impl ProgressLogger for MultiplexedProgressLogger {
     fn flush_output(&self, id: &StepId) {
         let mut buffers = self.partial_lines.lock().unwrap();
         if let Some(buffer) = buffers.remove(id)
-            && !buffer.is_empty() {
-                self.display.append_output(id.as_str(), buffer);
-            }
+            && !buffer.is_empty()
+        {
+            self.display.append_output(id.as_str(), buffer);
+        }
     }
 
     fn output_policy(&self) -> OutputPolicy {

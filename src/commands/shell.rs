@@ -5,13 +5,13 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 
 use crate::{
     commands::build::build_selected_contexts,
     config::{RepoConfig, Selector},
+    error::{RtError, RtResult},
     ui::{self},
-    venv::{select_execution_contexts, venv_python_path, ExecutionContext, RiotVenv},
+    venv::{ExecutionContext, RiotVenv, select_execution_contexts, venv_python_path},
 };
 
 /// Build the requested environment and spawn an interactive shell with it active.
@@ -24,7 +24,7 @@ pub fn run(
     repo: &RepoConfig,
     hash: &str,
     force_reinstall: bool,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let target = resolve_target(venvs, hash)?;
 
     build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall)?;
@@ -41,23 +41,26 @@ pub fn run(
 /// # Errors
 ///
 /// Returns an error if selection is ambiguous or selection fails.
-pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> PyResult<RiotVenv> {
+pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> RtResult<RiotVenv> {
     let mut venvs = select_execution_contexts(venvs, Selector::Pattern(hash.to_string()))?;
     if venvs.len() != 1 {
-        eprintln!("Found multiple corresponding virtual environments, aborting...");
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::message(
+            "Found multiple corresponding virtual environments, aborting...",
+        ));
     }
     let Some(mut venv) = venvs.pop() else {
-        eprintln!("Found multiple corresponding virtual environments, aborting...");
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::message(
+            "Found multiple corresponding virtual environments, aborting...",
+        ));
     };
 
     venv.execution_contexts.retain(|exc| exc.hash == hash);
 
     let n_ctx = venv.execution_contexts.len();
     if n_ctx >= 2 {
-        eprintln!("Found multiple corresponding virtual environments, aborting...");
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::message(
+            "Found multiple corresponding virtual environments, aborting...",
+        ));
     }
 
     if n_ctx == 1 {
@@ -68,7 +71,7 @@ pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> PyResult
     Ok(venv)
 }
 
-#[must_use] 
+#[must_use]
 pub fn make_venv_shell_context(venv: &RiotVenv) -> ExecutionContext {
     ExecutionContext {
         command: None,
@@ -80,7 +83,7 @@ pub fn make_venv_shell_context(venv: &RiotVenv) -> ExecutionContext {
     }
 }
 
-fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> PyResult<()> {
+fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {
     let python_path = venv_python_path(&repo.riot_root, &exc_ctx.hash);
 
     let shell = preferred_shell();
@@ -113,14 +116,16 @@ fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> PyResult<()> {
     command.envs(repo.run_env.iter());
 
     let status = command.status().map_err(|err| {
-        eprintln!("error: failed to spawn shell for {}: {err}", exc_ctx.hash);
-        PyErr::new::<PySystemExit, _>(1)
+        RtError::message(format!(
+            "error: failed to spawn shell for {}: {err}",
+            exc_ctx.hash
+        ))
     })?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(PyErr::new::<PySystemExit, _>(status.code().unwrap_or(1)))
+        Err(RtError::silent(status.code().unwrap_or(1) as u8))
     }
 }
 

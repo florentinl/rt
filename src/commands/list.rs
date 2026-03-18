@@ -1,12 +1,12 @@
 use indexmap::IndexMap;
-use pyo3::{exceptions::PySystemExit, prelude::*};
 use serde::Serialize;
 use serde_json::to_string_pretty;
 
 use crate::{
     config::{RepoConfig, Selector},
+    error::{RtError, RtResult},
     ui,
-    venv::{select_execution_contexts, venv_path, RiotVenv},
+    venv::{RiotVenv, select_execution_contexts, venv_path},
 };
 
 #[derive(Serialize)]
@@ -44,7 +44,7 @@ pub fn run(
     selector: Selector,
     hash_only: bool,
     json: bool,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let mut venvs = select_execution_contexts(venvs, selector)?;
 
     venvs.retain(|v| !v.execution_contexts.is_empty());
@@ -101,8 +101,7 @@ pub fn run(
             .collect();
 
         let output = to_string_pretty(&json_venvs).map_err(|err| {
-            eprintln!("error: failed to serialize venvs as JSON: {err}");
-            PyErr::new::<PySystemExit, _>(1)
+            RtError::message(format!("error: failed to serialize venvs as JSON: {err}"))
         })?;
         println!("{output}");
         return Ok(());

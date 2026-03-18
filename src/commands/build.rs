@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
     fmt::Write as FmtWrite,
     fs::{self, File},
     io::{self, IsTerminal, Write},
@@ -11,6 +10,7 @@ use std::{
 use crate::{
     command::ManagedCommand,
     config::Selector,
+    error::{RtError, RtResult},
     progress::{
         MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
         StepOutcome, Task, TaskRunner, summarize_errors,
@@ -21,7 +21,6 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use tempfile::{Builder, NamedTempFile};
 
-use pyo3::{PyErr, PyResult, exceptions::PySystemExit};
 use rayon::current_num_threads;
 
 use crate::{
@@ -40,7 +39,7 @@ pub fn run(
     repo: &RepoConfig,
     selector: Selector,
     force_reinstall: bool,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let selected = select_execution_contexts(venvs, selector)?;
     build_selected_contexts(repo, &selected, force_reinstall)?;
     Ok(())
@@ -70,13 +69,14 @@ pub fn build_selected_contexts(
     repo: &RepoConfig,
     selected: &[RiotVenv],
     force_reinstall: bool,
-) -> PyResult<()> {
+) -> RtResult<()> {
     if let Err(e) = fs::DirBuilder::new()
         .recursive(true)
         .create(&repo.riot_root)
     {
-        eprintln!("error: could not create riot root: {e}");
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::message(format!(
+            "error: could not create riot root: {e}"
+        )));
     }
     let sink: Arc<dyn ProgressLogger> = if io::stderr().is_terminal() {
         match MultiplexedProgressLogger::new() {
@@ -139,28 +139,29 @@ pub fn build_selected_contexts(
         .collect();
 
     let setup_errors = runner.run(setup_tasks).map_err(|err| {
-        eprintln!("error: could not configure build parallelism ({err})");
-        PyErr::new::<PySystemExit, _>(1)
+        RtError::message(format!(
+            "error: could not configure build parallelism ({err})"
+        ))
     })?;
 
     if summarize_errors(&setup_errors, "build") {
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::silent(1));
     }
 
     let exc_errors = runner.run(exc_ctx_tasks).map_err(|err| {
-        eprintln!("error: could not configure build parallelism ({err})");
-        PyErr::new::<PySystemExit, _>(1)
+        RtError::message(format!(
+            "error: could not configure build parallelism ({err})"
+        ))
     })?;
 
     if summarize_errors(&exc_errors, "build") {
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::silent(1));
     }
 
     Ok(())
 }
 
-type DynError = Box<dyn Error + Send + Sync>;
-type DynResult<T> = Result<T, DynError>;
+type DynResult<T> = RtResult<T>;
 
 pub struct BuildSharedState {
     force_reinstall: bool,
@@ -213,9 +214,9 @@ impl BuildSharedState {
             .status()?;
 
         if !status.success() {
-            return Err(Box::new(io::Error::other(format!(
-                "uv pip install failed with status {status}"
-            ))));
+            return Err(RtError::message(format!(
+                "error: uv pip install failed with status {status}"
+            )));
         }
 
         File::create(marker_path)?;
@@ -273,9 +274,9 @@ impl BuildSharedState {
             .status()?;
 
         if !status.success() {
-            return Err(Box::new(io::Error::other(format!(
-                "uv pip install failed with status {status}"
-            ))));
+            return Err(RtError::message(format!(
+                "error: uv pip install failed with status {status}"
+            )));
         }
 
         File::create(marker_path)?;
@@ -313,9 +314,9 @@ impl BuildSharedState {
             .status()?;
 
         if !status.success() {
-            return Err(Box::new(io::Error::other(format!(
-                "uv venv failed with status {status}"
-            ))));
+            return Err(RtError::message(format!(
+                "error: uv venv failed with status {status}"
+            )));
         }
 
         let site_packages_path =
@@ -333,7 +334,7 @@ impl BuildSharedState {
             bin_sources.push(dev_install_path);
         }
         bin_sources.push(&deps_install_path);
-        merge_bin_dirs(&exc_venv_path, &bin_sources).map_err(|err| Box::new(err) as DynError)?;
+        merge_bin_dirs(&exc_venv_path, &bin_sources)?;
 
         File::create(marker_path)?;
 
@@ -347,13 +348,13 @@ impl BuildSharedState {
         dev_install_path: Option<&PathBuf>,
         site_packages_path: &Path,
         services: &[String],
-    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    ) -> RtResult<()> {
         fs::create_dir_all(site_packages_path)?;
 
-        let current_dir = self.riot_root.parent().ok_or_else(|| {
-            eprintln!("error: could not find riot root parent");
-            PyErr::new::<PySystemExit, _>(1)
-        })?;
+        let current_dir = self
+            .riot_root
+            .parent()
+            .ok_or_else(|| RtError::message("error: could not find riot root parent"))?;
 
         let mut paths = vec![];
         if let Some(dev_install_path) = dev_install_path {

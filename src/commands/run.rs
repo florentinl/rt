@@ -1,17 +1,17 @@
 use std::{io::IsTerminal, sync::Arc};
 
 use indexmap::IndexMap;
-use pyo3::{exceptions::PySystemExit, PyErr, PyResult};
 
 use crate::{
     command::ManagedCommand,
     commands::build::{build_selected_contexts, collect_context_indices},
     config::{RepoConfig, RunConfig, Selector},
+    error::{RtError, RtResult},
     progress::{
-        summarize_errors, MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger,
-        StepContext, StepId, StepOutcome, Task, TaskRunner,
+        MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
+        StepOutcome, Task, TaskRunner, summarize_errors,
     },
-    venv::{select_execution_contexts, venv_python_path, ExecutionContext, RiotVenv},
+    venv::{ExecutionContext, RiotVenv, select_execution_contexts, venv_python_path},
 };
 /// Build and execute the command for the given execution context.
 ///
@@ -25,17 +25,16 @@ pub fn run(
     force_reinstall: bool,
     parallel: Option<usize>,
     run_config: &RunConfig,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let selected = select_execution_contexts(venvs, selector)?;
 
     for selected_venv in &selected {
         for exc_ctx in &selected_venv.execution_contexts {
             if run_config.command_override.is_none() && exc_ctx.command.is_none() {
-                eprintln!(
+                return Err(RtError::message(format!(
                     "error: execution context {} has no command configured",
                     exc_ctx.hash
-                );
-                return Err(PyErr::new::<PySystemExit, _>(1));
+                )));
             }
         }
     }
@@ -61,10 +60,10 @@ fn run_contexts(
     run_config: &RunConfig,
     parallelism: Option<usize>,
     sink: Arc<dyn ProgressLogger>,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let runner = TaskRunner::new(sink).with_parallelism(parallelism);
 
-    let tasks: Vec<Task<'_, PyErr>> = collect_context_indices(selected)
+    let tasks: Vec<Task<'_, RtError>> = collect_context_indices(selected)
         .iter()
         .map(|&(venv_i, exc_i)| {
             let exc_ctx: ExecutionContext = selected[venv_i].execution_contexts[exc_i].clone();
@@ -76,12 +75,11 @@ fn run_contexts(
         .collect();
 
     let errors = runner.run(tasks).map_err(|err| {
-        eprintln!("error: could not configure parallelism ({err})");
-        PyErr::new::<PySystemExit, _>(1)
+        RtError::message(format!("error: could not configure parallelism ({err})"))
     })?;
 
     if summarize_errors(&errors, "run") {
-        return Err(PyErr::new::<PySystemExit, _>(1));
+        return Err(RtError::silent(1));
     }
 
     Ok(())
@@ -92,7 +90,7 @@ fn execute_command(
     exc_ctx: &ExecutionContext,
     run_config: &RunConfig,
     ctx: &StepContext,
-) -> PyResult<StepOutcome> {
+) -> RtResult<StepOutcome> {
     let command_line = {
         let exc_ctx: &ExecutionContext = exc_ctx;
         let mut command_template = run_config.command_override.as_ref().map_or_else(
@@ -117,14 +115,15 @@ fn execute_command(
         .args(["sh", "-c", &command_line])
         .status()
         .map_err(|err| {
-            eprintln!("error: failed to execute command `{command_line}`: {err}");
-            PyErr::new::<PySystemExit, _>(1)
+            RtError::message(format!(
+                "error: failed to execute command `{command_line}`: {err}"
+            ))
         })?;
 
     status
         .success()
         .then_some(StepOutcome::Done)
-        .ok_or_else(|| PyErr::new::<PySystemExit, _>(status.code().unwrap_or(1)))
+        .ok_or_else(|| RtError::silent(status.code().unwrap_or(1) as u8))
 }
 
 fn format_cmdargs(args: &[String]) -> String {

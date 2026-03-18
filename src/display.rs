@@ -1,18 +1,17 @@
 use crossterm::{
-    cursor,
+    ExecutableCommand, QueueableCommand, cursor,
     style::{Color, Stylize},
     terminal::{self as crossterm_terminal, ClearType},
-    ExecutableCommand, QueueableCommand,
 };
 use indexmap::IndexMap;
 use std::{
     collections::VecDeque,
     convert::TryFrom,
     fmt::Write as FmtWrite,
-    io::{self, stderr, Write},
+    io::{self, Write, stderr},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -28,7 +27,7 @@ fn visual_width(text: &str) -> usize {
             // Skip ANSI escape sequence
             if chars.peek() == Some(&'[') {
                 chars.next(); // consume '['
-                              // Skip until we hit a letter (the command character)
+                // Skip until we hit a letter (the command character)
                 while let Some(&next_ch) = chars.peek() {
                     chars.next();
                     if next_ch.is_ascii_alphabetic() {
@@ -372,30 +371,32 @@ impl DisplayManager {
         let refresh_rate = self.refresh_rate;
         let start_time = self.start_time;
 
-        let handle = thread::spawn(move || loop {
-            let shutting_down = shutdown.load(Ordering::Relaxed);
-            let should_render = shutting_down || !final_rendered.load(Ordering::Relaxed);
+        let handle = thread::spawn(move || {
+            loop {
+                let shutting_down = shutdown.load(Ordering::Relaxed);
+                let should_render = shutting_down || !final_rendered.load(Ordering::Relaxed);
 
-            if should_render {
-                let steps = steps.lock().unwrap();
-                let mut lines_count = lines_last_render.lock().unwrap();
-                let mut stderr = stderr.lock().unwrap();
-                if let Err(e) = Self::render_locked(
-                    &steps,
-                    &mut stderr,
-                    &mut lines_count,
-                    &final_rendered,
-                    start_time,
-                ) {
-                    eprintln!("Display render error: {e}");
+                if should_render {
+                    let steps = steps.lock().unwrap();
+                    let mut lines_count = lines_last_render.lock().unwrap();
+                    let mut stderr = stderr.lock().unwrap();
+                    if let Err(e) = Self::render_locked(
+                        &steps,
+                        &mut stderr,
+                        &mut lines_count,
+                        &final_rendered,
+                        start_time,
+                    ) {
+                        eprintln!("Display render error: {e}");
+                    }
                 }
-            }
 
-            if shutting_down {
-                break;
-            }
+                if shutting_down {
+                    break;
+                }
 
-            thread::sleep(refresh_rate);
+                thread::sleep(refresh_rate);
+            }
         });
 
         *self.refresh_handle.lock().unwrap() = Some(handle);
@@ -708,8 +709,8 @@ fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         // Try to restore terminal
-        use crossterm::cursor;
         use crossterm::ExecutableCommand;
+        use crossterm::cursor;
         let _ = std::io::stdout().execute(cursor::Show);
         let _ = std::io::stderr().execute(cursor::Show);
 

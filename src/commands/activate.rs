@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use indexmap::IndexMap;
-use pyo3::PyResult;
 
 use crate::{
     commands::{build::build_selected_contexts, shell::resolve_target},
     config::RepoConfig,
+    error::RtResult,
     ui,
     venv::{self, RiotVenv},
 };
@@ -20,7 +20,7 @@ pub fn run(
     repo: &RepoConfig,
     hash: &str,
     force_reinstall: bool,
-) -> PyResult<()> {
+) -> RtResult<()> {
     let target = resolve_target(venvs, hash)?;
     let ctx_hash = &target.execution_contexts[0].hash;
     build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall)?;

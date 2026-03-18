@@ -1,20 +1,21 @@
 use std::collections::{HashMap, HashSet};
 
 use clap::builder::StyledStr;
-use clap_complete::{engine::ValueCompleter, CompletionCandidate};
+use clap_complete::{CompletionCandidate, engine::ValueCompleter};
 use indexmap::IndexMap;
-use pyo3::Python;
 
 use crate::{
+    DefaultConfigProvider,
     config::Selector,
     locate_riotfile,
     ui::{format_envs, format_pkgs},
-    venv::{compare_python_versions, get_context, select_execution_contexts, RiotVenv},
+    venv::{RiotVenv, compare_python_versions, load_context, select_execution_contexts},
 };
 
-pub fn get_venvs() -> IndexMap<String, RiotVenv> {
-    Python::initialize();
-    Python::attach(|py| get_context(py, &locate_riotfile(None)))
+fn get_venvs() -> IndexMap<String, RiotVenv> {
+    locate_riotfile(None)
+        .and_then(|path| load_context::<DefaultConfigProvider>(&path))
+        .unwrap_or_default()
 }
 
 pub struct PythonCompleter;
