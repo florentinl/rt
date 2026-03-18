@@ -473,7 +473,7 @@ fn parse_pytest_target(command: &str) -> Option<String> {
         if (candidate.is_dir() || candidate.extension().is_some_and(|ext| ext == "py"))
             && candidate.exists()
         {
-            return Some(token.to_string());
+            return Some(token.clone());
         }
     }
 

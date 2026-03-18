@@ -125,7 +125,7 @@ fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(RtError::silent(status.code().unwrap_or(1) as u8))
+        Err(RtError::silent_from_status(status))
     }
 }
 

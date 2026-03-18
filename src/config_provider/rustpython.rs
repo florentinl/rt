@@ -333,7 +333,7 @@ fn parse_version_components(version: &str) -> Option<Vec<u32>> {
 
 #[pymodule]
 mod rt_native {
-    use super::*;
+    use super::{Path, PyResult, VirtualMachine, YamlValue, fs, yaml_to_json_value};
 
     #[pyfunction]
     fn load_yaml(source: String, vm: &VirtualMachine) -> PyResult<String> {
@@ -357,17 +357,12 @@ fn yaml_to_json_value(value: YamlValue) -> JsonValue {
     match value {
         YamlValue::Null => JsonValue::Null,
         YamlValue::Bool(value) => JsonValue::Bool(value),
-        YamlValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                JsonValue::from(value)
-            } else if let Some(value) = value.as_u64() {
-                JsonValue::from(value)
-            } else if let Some(value) = value.as_f64() {
-                JsonValue::from(value)
-            } else {
-                JsonValue::Null
-            }
-        }
+        YamlValue::Number(value) => value
+            .as_i64()
+            .map(JsonValue::from)
+            .or_else(|| value.as_u64().map(JsonValue::from))
+            .or_else(|| value.as_f64().map(JsonValue::from))
+            .unwrap_or(JsonValue::Null),
         YamlValue::String(value) => JsonValue::String(value),
         YamlValue::Sequence(values) => {
             JsonValue::Array(values.into_iter().map(yaml_to_json_value).collect())

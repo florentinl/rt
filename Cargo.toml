@@ -15,7 +15,7 @@ panic = "abort"
 codegen-units = 1
 
 [dependencies]
-uv = { version = "0.10.6", default-features = false, features = [
+uv = { version = "0.10.11", default-features = false, features = [
     "performance",
     "performance-memory-allocator",
 ] }
@@ -25,8 +25,8 @@ rustpython = { version = "0.4.0", features = ["freeze-stdlib"], optional = true 
 rustpython-vm = { version = "0.4.0", optional = true }
 rayon = "1.11.0"
 
-clap = { version = "4.5.60", features = ["derive", "unstable-ext"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap = { version = "4.6.0", features = ["derive", "unstable-ext"] }
+clap_complete = { version = "4.6.0", features = ["unstable-dynamic"] }
 crossterm = "0.29"
 
 toml = "1.0"
@@ -36,7 +36,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 indexmap = { version = "2.13.0", features = ["serde"] }
 shell-words = "1.1"
 itertools = "0.14"
-tempfile = "3.26"
+tempfile = "3.27"
 sha2 = "0.10"
 fancy-regex = "0.17.0"
 serde_yaml = "0.9.34"

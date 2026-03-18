@@ -1,4 +1,7 @@
-use std::fmt::{self, Display, Formatter};
+use std::{
+    fmt::{self, Display, Formatter},
+    process::ExitStatus,
+};
 
 pub type RtResult<T> = Result<T, RtError>;
 
@@ -31,6 +34,11 @@ impl RtError {
             exit_code,
             message: None,
         }
+    }
+
+    #[must_use]
+    pub fn silent_from_status(status: ExitStatus) -> Self {
+        Self::silent(status_exit_code(status))
     }
 
     #[must_use]
@@ -67,4 +75,11 @@ impl From<std::fmt::Error> for RtError {
     fn from(value: std::fmt::Error) -> Self {
         Self::message(format!("error: {value}"))
     }
+}
+
+fn status_exit_code(status: ExitStatus) -> u8 {
+    status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .unwrap_or(1)
 }

@@ -123,7 +123,7 @@ fn execute_command(
     status
         .success()
         .then_some(StepOutcome::Done)
-        .ok_or_else(|| RtError::silent(status.code().unwrap_or(1) as u8))
+        .ok_or_else(|| RtError::silent_from_status(status))
 }
 
 fn format_cmdargs(args: &[String]) -> String {
