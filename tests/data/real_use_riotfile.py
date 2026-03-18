@@ -1,4 +1,6 @@
-from riot import latest, Venv
+from riot import Venv
+
+latest = ""
 
 venv = Venv(
     pys=3,

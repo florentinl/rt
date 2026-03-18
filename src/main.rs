@@ -22,7 +22,6 @@ mod venv;
 
 use crate::{
     config::{RepoConfig, RunConfig, Selector, load_rt_toml},
-    config_provider::Pyo3ConfigProvider,
     error::{RtError, RtResult},
     venv::{RiotVenv, load_context},
 };
@@ -31,7 +30,15 @@ use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
-type DefaultConfigProvider = Pyo3ConfigProvider;
+#[cfg(feature = "provider-pyo3")]
+type DefaultConfigProvider = crate::config_provider::Pyo3ConfigProvider;
+#[cfg(all(not(feature = "provider-pyo3"), feature = "provider-rustpython"))]
+type DefaultConfigProvider = crate::config_provider::RustPythonConfigProvider;
+
+#[cfg(not(any(feature = "provider-pyo3", feature = "provider-rustpython")))]
+compile_error!(
+    "Enable at least one config provider feature: `provider-pyo3` or `provider-rustpython`."
+);
 
 #[derive(Parser)]
 #[command(
@@ -318,6 +325,12 @@ fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> Rt
     path.ok_or_else(|| RtError::message("error: could not create riot root directory"))
 }
 
+fn load_context_with_default_provider(
+    riotfile_path: &Path,
+) -> RtResult<IndexMap<String, RiotVenv>> {
+    load_context::<DefaultConfigProvider>(riotfile_path)
+}
+
 fn main() -> ExitCode {
     if let Ok(value) = std::env::var("RT_IS_UV_NOW")
         && value == "true"
@@ -340,7 +353,7 @@ fn try_main() -> RtResult<()> {
 
     let riotfile_path = locate_riotfile(cli.file.as_ref())?;
     let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
-    let riot_venvs = load_context::<DefaultConfigProvider>(&riotfile_path)?;
+    let riot_venvs = load_context_with_default_provider(&riotfile_path)?;
 
     let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
     let repo_config = RepoConfig::load(riotfile_path, riot_root, build_env, run_env);

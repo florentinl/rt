@@ -5,16 +5,15 @@ use clap_complete::{CompletionCandidate, engine::ValueCompleter};
 use indexmap::IndexMap;
 
 use crate::{
-    DefaultConfigProvider,
     config::Selector,
-    locate_riotfile,
+    load_context_with_default_provider, locate_riotfile,
     ui::{format_envs, format_pkgs},
-    venv::{RiotVenv, compare_python_versions, load_context, select_execution_contexts},
+    venv::{RiotVenv, compare_python_versions, select_execution_contexts},
 };
 
 fn get_venvs() -> IndexMap<String, RiotVenv> {
     locate_riotfile(None)
-        .and_then(|path| load_context::<DefaultConfigProvider>(&path))
+        .and_then(|path| load_context_with_default_provider(&path))
         .unwrap_or_default()
 }
 
