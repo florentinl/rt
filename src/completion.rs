@@ -1,0 +1,142 @@
+use std::collections::{HashMap, HashSet};
+
+use clap::builder::StyledStr;
+use clap_complete::{CompletionCandidate, engine::ValueCompleter};
+use indexmap::IndexMap;
+
+use crate::{
+    config::Selector,
+    load_context_with_default_provider, locate_riotfile,
+    ui::{format_envs, format_pkgs},
+    venv::{RiotVenv, compare_python_versions, select_execution_contexts},
+};
+
+fn get_venvs() -> IndexMap<String, RiotVenv> {
+    locate_riotfile(None)
+        .and_then(|path| load_context_with_default_provider(&path))
+        .unwrap_or_default()
+}
+
+pub struct PythonCompleter;
+
+impl ValueCompleter for PythonCompleter {
+    fn complete(&self, current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+        let Some(hint) = current.to_str() else {
+            return vec![];
+        };
+
+        let mut python_version: HashSet<&String> = HashSet::new();
+
+        let venvs = get_venvs();
+        for (_, venv) in &venvs {
+            if venv.python.starts_with(hint) {
+                python_version.insert(&venv.python);
+            }
+        }
+
+        let mut python_version: Vec<_> = python_version.into_iter().collect();
+        python_version.sort_by(|a, b| compare_python_versions(a, b));
+
+        python_version
+            .into_iter()
+            .map(|value| CompletionCandidate::new(value.as_str()))
+            .collect()
+    }
+}
+
+pub struct NameCompleter;
+
+impl ValueCompleter for NameCompleter {
+    fn complete(&self, current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str() else {
+            return vec![];
+        };
+
+        let selected_venvs =
+            select_execution_contexts(get_venvs(), Selector::Pattern(current.to_string()))
+                .unwrap_or_default();
+
+        let mut venv_names = HashSet::new();
+
+        for selected in selected_venvs {
+            venv_names.insert(selected.name);
+        }
+
+        let mut venv_names: Vec<_> = venv_names.iter().collect();
+        venv_names.sort();
+
+        venv_names.iter().map(CompletionCandidate::new).collect()
+    }
+}
+
+fn complete_selector(current: &std::ffi::OsStr, with_names: bool) -> Vec<CompletionCandidate> {
+    let Some(hint) = current.to_str() else {
+        return vec![];
+    };
+
+    let selected = select_execution_contexts(get_venvs(), Selector::Pattern(hint.to_string()))
+        .unwrap_or_default();
+
+    let mut candidates: HashMap<String, CompletionCandidate> = HashMap::new();
+
+    for selected in &selected {
+        if with_names {
+            candidates.insert(
+                selected.name.clone(),
+                CompletionCandidate::new(&selected.name),
+            );
+        }
+
+        let pkgs_detail = if selected.pkgs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", format_pkgs(&selected.pkgs, &selected.shared_pkgs),)
+        };
+
+        let short_hash = selected.hash.clone();
+        let short_hash_candidate =
+            CompletionCandidate::new(short_hash.as_str()).help(Some(StyledStr::from(format!(
+                "{} ({}){}",
+                selected.name, selected.python, pkgs_detail
+            ))));
+        candidates.insert(short_hash, short_hash_candidate);
+
+        for ctx in &selected.execution_contexts {
+            let env_detail = if selected.shared_env.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", format_envs(&ctx.env, &selected.shared_env),)
+            };
+            let ctx_hash = ctx.hash.clone();
+            let ctx_candidate =
+                CompletionCandidate::new(ctx_hash.as_str()).help(Some(StyledStr::from(format!(
+                    "{} ({}){}{}",
+                    selected.name, selected.python, pkgs_detail, env_detail
+                ))));
+            candidates.insert(ctx_hash, ctx_candidate);
+        }
+    }
+
+    let mut completion_candidates = Vec::new();
+    for (_, candidate) in candidates {
+        completion_candidates.push(candidate);
+    }
+
+    completion_candidates
+}
+
+pub struct SelectorCompleter;
+
+impl ValueCompleter for SelectorCompleter {
+    fn complete(&self, current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+        complete_selector(current, true)
+    }
+}
+
+pub struct HashCompleter;
+
+impl ValueCompleter for HashCompleter {
+    fn complete(&self, current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+        complete_selector(current, false)
+    }
+}

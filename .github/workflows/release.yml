@@ -1,0 +1,39 @@
+name: Release VS Code Extension
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    name: Build & Release VSIX
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: riot-extension/package-lock.json
+
+      - name: Install dependencies
+        working-directory: riot-extension
+        run: npm ci
+
+      - name: Package VS Code extension
+        working-directory: riot-extension
+        run: npm run dist
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Riot ${{ github.ref_name }}
+          files: riot-extension/*.vsix
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

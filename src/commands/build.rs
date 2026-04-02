@@ -1,0 +1,605 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as FmtWrite,
+    fs::{self, File},
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use crate::{
+    command::ManagedCommand,
+    config::Selector,
+    error::{RtError, RtResult},
+    progress::{
+        MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
+        StepOutcome, Task, TaskRunner, summarize_errors,
+    },
+    venv::{ExecutionContext, RiotVenv, venv_path},
+};
+use indexmap::IndexMap;
+use itertools::Itertools;
+use tempfile::{Builder, NamedTempFile};
+
+use rayon::current_num_threads;
+
+use crate::{
+    config::RepoConfig,
+    constants::{DONE_MARKER, REQUIREMENTS_DIR, VENV_DEPS_DIR, VENV_SELF_DIR},
+    venv::select_execution_contexts,
+};
+
+/// Build the virtual environment for the provided execution context.
+///
+/// # Errors
+///
+/// Returns an error when context selection fails or any build step fails.
+pub fn run(
+    venvs: IndexMap<String, RiotVenv>,
+    repo: &RepoConfig,
+    selector: Selector,
+    force_reinstall: bool,
+    no_editable: bool,
+) -> RtResult<()> {
+    let selected = select_execution_contexts(venvs, selector)?;
+    build_selected_contexts(repo, &selected, force_reinstall, no_editable)?;
+    Ok(())
+}
+
+#[must_use]
+pub fn collect_context_indices(selected: &[RiotVenv]) -> Vec<(usize, usize)> {
+    selected
+        .iter()
+        .enumerate()
+        .flat_map(|(venv_idx, selected_venv)| {
+            selected_venv
+                .execution_contexts
+                .iter()
+                .enumerate()
+                .map(move |(ctx_idx, _)| (venv_idx, ctx_idx))
+        })
+        .collect()
+}
+
+/// Build every selected execution context and its shared dependencies.
+///
+/// # Errors
+///
+/// Returns an error when the riot root cannot be prepared or any task fails.
+pub fn build_selected_contexts(
+    repo: &RepoConfig,
+    selected: &[RiotVenv],
+    force_reinstall: bool,
+    no_editable: bool,
+) -> RtResult<()> {
+    if let Err(e) = fs::DirBuilder::new()
+        .recursive(true)
+        .create(&repo.riot_root)
+    {
+        return Err(RtError::message(format!(
+            "error: could not create riot root: {e}"
+        )));
+    }
+    let sink: Arc<dyn ProgressLogger> = if io::stderr().is_terminal() {
+        match MultiplexedProgressLogger::new() {
+            Ok(logger) => Arc::new(logger),
+            Err(_) => Arc::new(PlainProgressLogger::default()),
+        }
+    } else {
+        Arc::new(PlainProgressLogger::default())
+    };
+    let shared = Arc::new(BuildSharedState::new(
+        force_reinstall,
+        no_editable,
+        Arc::clone(&repo.build_env),
+        Arc::clone(&repo.run_env),
+        repo.riot_root.clone(),
+    ));
+    let runner = TaskRunner::new(Arc::clone(&sink)).with_parallelism(Some(current_num_threads()));
+
+    let context_indices = collect_context_indices(selected);
+
+    let mut dev_pythons: HashSet<String> = HashSet::new();
+    let mut deps_targets: HashSet<usize> = HashSet::new();
+    for (venv_idx, ctx_idx) in &context_indices {
+        let selected_venv = &selected[*venv_idx];
+        let exc = &selected_venv.execution_contexts[*ctx_idx];
+        if !exc.skip_dev_install {
+            dev_pythons.insert(selected_venv.python.clone());
+        }
+        deps_targets.insert(*venv_idx);
+    }
+
+    let mut setup_tasks: Vec<_> = Vec::new();
+    setup_tasks.extend(dev_pythons.into_iter().map(|python| {
+        let state = Arc::clone(&shared);
+        let step_id = format!("dev install {python}");
+        Task::new(StepId::new(&step_id), &step_id, move |ctx| {
+            state.ensure_dev_install(&python, &ctx)
+        })
+    }));
+
+    setup_tasks.extend(deps_targets.into_iter().map(|idx| {
+        let state = Arc::clone(&shared);
+        let venv = &selected[idx];
+        let step_id = format!("deps install {}", venv.hash);
+        Task::new(StepId::new(&step_id), &step_id, move |ctx| {
+            state.ensure_deps_install(venv, &ctx)
+        })
+    }));
+
+    let exc_ctx_tasks: Vec<_> = context_indices
+        .iter()
+        .map(|&(venv_i, exc_i)| {
+            let state = Arc::clone(&shared);
+            let venv = &selected[venv_i];
+            let exc_ctx = &venv.execution_contexts[exc_i];
+            let step_id = format!("create execution context {}", exc_ctx.hash);
+            Task::new(StepId::new(&step_id), &step_id, move |ctx| {
+                state.ensure_execution_ctx(venv, exc_ctx, &ctx)
+            })
+        })
+        .collect();
+
+    // Pre-register phase-2 tasks so the total count is correct from the start.
+    for task in &exc_ctx_tasks {
+        sink.register_step(&task.id, &task.label);
+    }
+
+    let setup_errors = runner.run(setup_tasks).map_err(|err| {
+        RtError::message(format!(
+            "error: could not configure build parallelism ({err})"
+        ))
+    })?;
+
+    if summarize_errors(&setup_errors, "build") {
+        return Err(RtError::silent(1));
+    }
+
+    let exc_errors = runner.run(exc_ctx_tasks).map_err(|err| {
+        RtError::message(format!(
+            "error: could not configure build parallelism ({err})"
+        ))
+    })?;
+
+    if summarize_errors(&exc_errors, "build") {
+        return Err(RtError::silent(1));
+    }
+
+    Ok(())
+}
+
+type DynResult<T> = RtResult<T>;
+
+pub struct BuildSharedState {
+    force_reinstall: bool,
+    no_editable: bool,
+    build_env: Arc<HashMap<String, String>>,
+    run_env: Arc<HashMap<String, String>>,
+    riot_root: PathBuf,
+}
+
+impl BuildSharedState {
+    #[must_use]
+    pub const fn new(
+        force_reinstall: bool,
+        no_editable: bool,
+        build_env: Arc<HashMap<String, String>>,
+        run_env: Arc<HashMap<String, String>>,
+        riot_root: PathBuf,
+    ) -> Self {
+        Self {
+            force_reinstall,
+            no_editable,
+            build_env,
+            run_env,
+            riot_root,
+        }
+    }
+
+    fn ensure_dev_install(&self, python: &str, ctx: &StepContext) -> DynResult<StepOutcome> {
+        let dev_install_path =
+            get_dev_install_path(&self.riot_root, python, self.no_editable);
+
+        let marker_path = dev_install_path.join(DONE_MARKER);
+        if !self.force_reinstall && marker_path.is_file() {
+            return Ok(StepOutcome::Cached);
+        }
+
+        if dev_install_path.exists() {
+            fs::remove_dir_all(&dev_install_path)?;
+        }
+        fs::create_dir_all(&dev_install_path)?;
+
+        let mut cmd = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
+            .envs(self.build_env.as_ref())
+            .env("DD_FAST_BUILD", "1")
+            .arg("install")
+            .arg("-v")
+            .arg("--system")
+            .arg("--python")
+            .arg(python)
+            .arg("--target")
+            .arg(&dev_install_path);
+
+        cmd = if self.no_editable {
+            cmd.arg(".")
+        } else {
+            cmd.args(["-e", "."])
+                .args(["--config-setting", "editable_mode=compat"])
+        };
+
+        let status = cmd.status()?;
+
+        if !status.success() {
+            return Err(RtError::message(format!(
+                "error: uv pip install failed with status {status}"
+            )));
+        }
+
+        File::create(marker_path)?;
+
+        Ok(StepOutcome::Done)
+    }
+
+    fn get_requirements_file(&self, venv: &RiotVenv) -> DynResult<NamedTempFile> {
+        let requirements_txt = self
+            .riot_root
+            .join(REQUIREMENTS_DIR)
+            .join(format!("{}.txt", venv.hash));
+
+        let requirements = if requirements_txt.exists() {
+            fs::read_to_string(requirements_txt)?
+        } else {
+            format_requirements(&venv.pkgs)
+        }
+        .replace("/home/bits/project", ".");
+
+        let mut temp = Builder::new().suffix(".txt").tempfile()?;
+        temp.write_all(requirements.as_bytes())?;
+        temp.flush()?;
+
+        Ok(temp)
+    }
+
+    fn ensure_deps_install(&self, venv: &RiotVenv, ctx: &StepContext) -> DynResult<StepOutcome> {
+        let mut deps_install_path = self.riot_root.clone();
+        deps_install_path.push(VENV_DEPS_DIR);
+        deps_install_path.push(format!("deps_{}", venv.hash));
+
+        let requirements_file = self.get_requirements_file(venv)?;
+
+        let marker_path = deps_install_path.join(DONE_MARKER);
+        if !self.force_reinstall && marker_path.is_file() {
+            return Ok(StepOutcome::Cached);
+        }
+
+        if deps_install_path.exists() {
+            fs::remove_dir_all(&deps_install_path)?;
+        }
+        fs::create_dir_all(&deps_install_path)?;
+
+        let status = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
+            .envs(self.build_env.as_ref())
+            .arg("install")
+            .arg("--system")
+            .arg("--python")
+            .arg(&venv.python)
+            .arg("--target")
+            .arg(&deps_install_path)
+            .arg("--requirement")
+            .arg(requirements_file.path())
+            .status()?;
+
+        if !status.success() {
+            return Err(RtError::message(format!(
+                "error: uv pip install failed with status {status}"
+            )));
+        }
+
+        File::create(marker_path)?;
+
+        Ok(StepOutcome::Done)
+    }
+
+    fn ensure_execution_ctx(
+        &self,
+        venv: &RiotVenv,
+        exc: &ExecutionContext,
+        ctx: &StepContext,
+    ) -> DynResult<StepOutcome> {
+        let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
+        let marker_path = exc_venv_path.join(DONE_MARKER);
+
+        if !self.force_reinstall && marker_path.is_file() {
+            return Ok(StepOutcome::Cached);
+        }
+
+        if marker_path.is_file() {
+            fs::remove_file(&marker_path)?;
+        }
+
+        let deps_install_path = get_deps_install_path(&self.riot_root, &venv.hash);
+        let dev_install_path = (!exc.skip_dev_install)
+            .then_some(get_dev_install_path(&self.riot_root, &venv.python, self.no_editable));
+
+        let status = ManagedCommand::new_uv("venv", Arc::clone(&ctx.sink), ctx.step_id.clone())
+            .envs(self.build_env.as_ref())
+            .arg("--python")
+            .arg(&venv.python)
+            .arg("--clear")
+            .arg(&exc_venv_path)
+            .status()?;
+
+        if !status.success() {
+            return Err(RtError::message(format!(
+                "error: uv venv failed with status {status}"
+            )));
+        }
+
+        let site_packages_path =
+            exc_venv_path.join(format!("lib/python{}/site-packages", &venv.python));
+        self.configure_site_packages(
+            exc,
+            &deps_install_path,
+            dev_install_path.as_ref(),
+            &site_packages_path,
+            &venv.services,
+        )?;
+
+        let mut bin_sources: Vec<&Path> = Vec::new();
+        if let Some(ref dev_install_path) = dev_install_path {
+            bin_sources.push(dev_install_path);
+        }
+        bin_sources.push(&deps_install_path);
+        merge_bin_dirs(&exc_venv_path, &bin_sources)?;
+
+        File::create(marker_path)?;
+
+        Ok(StepOutcome::Done)
+    }
+
+    fn configure_site_packages(
+        &self,
+        exc: &ExecutionContext,
+        deps_install_path: &Path,
+        dev_install_path: Option<&PathBuf>,
+        site_packages_path: &Path,
+        services: &[String],
+    ) -> RtResult<()> {
+        fs::create_dir_all(site_packages_path)?;
+
+        let current_dir = self
+            .riot_root
+            .parent()
+            .ok_or_else(|| RtError::message("error: could not find riot root parent"))?;
+
+        let mut paths = vec![];
+        if let Some(dev_install_path) = dev_install_path {
+            paths.push((current_dir.to_string_lossy(), "current project"));
+            paths.push((
+                dev_install_path.to_string_lossy(),
+                "current project dependencies",
+            ));
+        }
+        paths.push((deps_install_path.to_string_lossy(), "riot dependencies"));
+
+        {
+            // pth file is mostly for analysis tools that do not execute sitecustomize.py to query site dirs
+            let pth_file = site_packages_path.join("riot.pth");
+            let pth_content = paths
+                .iter()
+                .map(|(path, comment)| format!("# {comment}\n{path}"))
+                .join("\n");
+            fs::write(pth_file, pth_content)?;
+        }
+
+        {
+            fs::write(
+                site_packages_path.join("pytest_rt.py"),
+                include_str!("../../pytest_rt/pytest_rt.py"),
+            )?;
+            fs::write(
+                site_packages_path.join("enable_pytest_rt.py"),
+                include_str!("../../pytest_rt/enable_pytest_rt.py"),
+            )?;
+        }
+
+        self.write_sitecustomize(site_packages_path, current_dir, &paths, exc, services)?;
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_sitecustomize(
+        &self,
+        site_packages_path: &Path,
+        current_dir: &Path,
+        paths: &[(std::borrow::Cow<'_, str>, &str)],
+        exc: &ExecutionContext,
+        services: &[String],
+    ) -> RtResult<()> {
+        let sitecustomize_path = site_packages_path.join("sitecustomize.py");
+        let mut sc = String::new();
+        sc.push_str("import site, os\n");
+
+        // adding paths in sitecustomize is necessary to include .pth files in each of these folders
+        for (path, comment) in paths {
+            writeln!(sc, "site.addsitedir(r\"{path}\") # {comment}")?;
+        }
+
+        if self.no_editable {
+            // In non-editable mode the installed package must take precedence
+            // over the local source tree.  Python puts '' (CWD) at sys.path[0]
+            // which would shadow the installed copy.  We remove both '' and the
+            // absolute project root, then re-append the project root at the end
+            // so test helpers remain importable but lose priority.
+            let project_root_str = current_dir.to_string_lossy();
+            writeln!(sc, "\nimport sys")?;
+            writeln!(
+                sc,
+                "sys.path[:] = [p for p in sys.path if p not in ('', r\"{project_root_str}\")]"
+            )?;
+            writeln!(
+                sc,
+                "sys.path.append(r\"{project_root_str}\")  # test helpers still importable, but last"
+            )?;
+        }
+
+        // environment variables from riotfile.py
+        if !exc.env.is_empty() {
+            sc.push_str("\n# Environment variables from riotfile.py\n");
+            for (key, val) in &exc.env {
+                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
+            }
+        }
+
+        // environment variables from rt.toml
+        if !self.run_env.is_empty() {
+            sc.push_str("\n# Environment variables from rt.toml\n");
+            for (key, val) in self.run_env.iter() {
+                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
+            }
+        }
+
+        writeln!(sc)?;
+        writeln!(
+            sc,
+            "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command"
+        )?;
+        writeln!(sc, "import enable_pytest_rt")?;
+
+        let services_csv = services.join(",");
+        let project_root = current_dir.to_string_lossy();
+
+        writeln!(
+            sc,
+            "os.environ[\"PYTHONPATH\"] = r\"{project_root}\" # Functionally useless but some tests assume that this env var is not empty..."
+        )?;
+        if services.iter().any(|svc| svc == "testagent") {
+            writeln!(
+                sc,
+                "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # configure testagent url because testagent service is enable"
+            )?;
+        }
+
+        writeln!(
+            sc,
+            "os.environ[\"RIOT_SUITESPEC_SERVICES\"] = r\"{services_csv}\" # store services to start for pytest_rt plugin"
+        )?;
+        writeln!(
+            sc,
+            "os.environ[\"RIOT_PROJECT_ROOT\"] = r\"{project_root}\" # store riot project root for pytest_rt plugin"
+        )?;
+        if let Some(command) = exc.command.as_ref() {
+            writeln!(
+                sc,
+                "os.environ[\"RIOT_ORIGINAL_COMMAND\"] = r\"{command}\" # store riotfile.py command for pytest_rt plugin"
+            )?;
+        }
+
+        fs::write(sitecustomize_path, sc)?;
+        Ok(())
+    }
+}
+
+fn get_dev_install_path(riot_root: &Path, python: &str, no_editable: bool) -> PathBuf {
+    let python_no_dot = python.replace('.', "");
+    let suffix = if no_editable { "_noedit" } else { "" };
+    let mut dev_install_path = riot_root.to_path_buf();
+    dev_install_path.push(VENV_SELF_DIR);
+    dev_install_path.push(format!("self_py{python_no_dot}{suffix}"));
+    dev_install_path
+}
+
+fn get_deps_install_path(riot_root: &Path, hash: &str) -> PathBuf {
+    let mut deps_install_path = riot_root.to_path_buf();
+    deps_install_path.push(VENV_DEPS_DIR);
+    deps_install_path.push(format!("deps_{hash}"));
+    deps_install_path
+}
+
+fn format_requirements(pkgs: &IndexMap<String, String>) -> String {
+    if pkgs.is_empty() {
+        return String::new();
+    }
+
+    let mut buf = String::new();
+    for (idx, (lib, version)) in pkgs.iter().enumerate() {
+        if idx > 0 {
+            buf.push('\n');
+        }
+        buf.push_str(lib);
+        buf.push_str(version);
+    }
+    buf.push('\n');
+    buf
+}
+
+fn merge_bin_dirs(venv_path: &Path, sources: &[&Path]) -> io::Result<()> {
+    let target_bin = venv_path.join("bin");
+    let absolute_venv = fs::canonicalize(venv_path).unwrap_or_else(|_| venv_path.to_path_buf());
+    let python_exe = absolute_venv.join("bin/python");
+    let python_shebang = format!("#!{}\n", python_exe.to_string_lossy());
+
+    for source in sources {
+        let source_bin = source.join("bin");
+        if !source_bin.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&source_bin)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                continue;
+            }
+            let target = target_bin.join(entry.file_name());
+            if target.exists() {
+                fs::remove_file(&target)?;
+            }
+
+            let content = fs::read(&path)?;
+            let rewritten = rewrite_python_shebang(&content, &python_shebang);
+            let data = rewritten.as_ref().unwrap_or(&content);
+            fs::write(&target, data)?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode();
+                fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_python_shebang(content: &[u8], python_shebang: &str) -> Option<Vec<u8>> {
+    if !content.starts_with(b"#!") {
+        return None;
+    }
+
+    let line_end = content
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(content.len());
+    let shebang_line = &content[..line_end];
+    let shebang_str = std::str::from_utf8(shebang_line).ok()?;
+
+    if !shebang_str.to_ascii_lowercase().contains("python") {
+        return None;
+    }
+
+    let rest_start = if line_end < content.len() {
+        line_end + 1
+    } else {
+        content.len()
+    };
+    let rest = &content[rest_start..];
+
+    let mut rewritten = Vec::with_capacity(python_shebang.len() + rest.len());
+    rewritten.extend_from_slice(python_shebang.as_bytes());
+    rewritten.extend_from_slice(rest);
+    Some(rewritten)
+}
