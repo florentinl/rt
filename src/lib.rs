@@ -367,10 +367,16 @@ fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> Rt
     path.ok_or_else(|| RtError::message("error: could not create riot root directory"))
 }
 
-fn load_context_with_default_provider(
+/// Load and normalize venvs from the riotfile, optionally enriching with lockfile data.
+///
+/// # Errors
+///
+/// Returns an error if the riotfile cannot be loaded or parsed.
+pub fn load_context_with_default_provider(
     riotfile_path: &Path,
+    riot_root: Option<&Path>,
 ) -> RtResult<IndexMap<String, RiotVenv>> {
-    load_context::<DefaultConfigProvider>(riotfile_path)
+    load_context::<DefaultConfigProvider>(riotfile_path, riot_root)
 }
 
 fn try_main(args: Vec<String>) -> RtResult<()> {
@@ -378,7 +384,7 @@ fn try_main(args: Vec<String>) -> RtResult<()> {
 
     let riotfile_path = locate_riotfile(cli.file.as_ref())?;
     let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
-    let riot_venvs = load_context_with_default_provider(&riotfile_path)?;
+    let riot_venvs = load_context_with_default_provider(&riotfile_path, Some(&riot_root))?;
 
     let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
     let repo_config = RepoConfig::load(riotfile_path, riot_root, build_env, run_env);

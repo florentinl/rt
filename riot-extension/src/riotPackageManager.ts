@@ -51,12 +51,14 @@ export class RiotPackageManager implements PackageManager {
     environment: PythonEnvironment,
   ): Promise<Package[] | undefined> {
     const venvHash = environment.envId.id;
-    const venv = await this.envManager.getVenvByHash(venvHash);
+    const venv = this.envManager.getVenvByHash(venvHash);
     if (!venv) {
       return [];
     }
 
-    return Object.entries(venv.pkgs).map(([name, version]) => ({
+    const displayPkgs = venv.display_pkgs ?? venv.pkgs;
+
+    return Object.entries(displayPkgs).map(([name, version]) => ({
       name,
       displayName: name,
       version,

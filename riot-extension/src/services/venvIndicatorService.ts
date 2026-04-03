@@ -17,9 +17,7 @@ export class VenvIndicatorService {
 
   constructor(
     private readonly api: PythonEnvironmentApi,
-    private readonly getVenvIndexes: () => Promise<
-      Map<string, Map<string, RtVenv>>
-    >,
+    private readonly getVenvIndexes: () => Map<string, Map<string, RtVenv>>,
     private readonly buildEnvironment: (
       venv: RtVenv,
       hash: string,
@@ -43,7 +41,7 @@ export class VenvIndicatorService {
       return;
     }
 
-    const venvIndexes = await this.getVenvIndexes();
+    const venvIndexes = this.getVenvIndexes();
     if (venvIndexes.size === 0) {
       return;
     }

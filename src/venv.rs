@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use fancy_regex::Regex;
@@ -11,7 +12,7 @@ use shell_words::split;
 use crate::{
     config::Selector,
     config_provider::{ConfigProvider, ProviderServices, ProviderVenvNode},
-    constants::VENV_PREFIX,
+    constants::{REQUIREMENTS_DIR, VENV_PREFIX},
     error::{RtError, RtResult},
 };
 
@@ -20,6 +21,10 @@ pub struct RiotVenv {
     pub name: String,
     pub python: String,
     pub pkgs: IndexMap<String, String>,
+    pub resolved_pkgs: IndexMap<String, String>,
+    /// Pre-formatted display versions for all packages (constrained + transitive).
+    /// Keys are package names, values are display strings like `"5.4.3 (>=5.0)"`.
+    pub display_pkgs: IndexMap<String, String>,
     pub hash: String,
     pub services: Vec<String>,
     pub execution_contexts: Vec<ExecutionContext>,
@@ -39,6 +44,8 @@ impl RiotVenv {
             name,
             python,
             pkgs,
+            resolved_pkgs: IndexMap::new(),
+            display_pkgs: IndexMap::new(),
             hash,
             services,
             execution_contexts: Vec::new(),
@@ -165,19 +172,25 @@ impl ResolvedSpec {
 
 pub fn load_context<P: ConfigProvider>(
     riotfile_path: &Path,
+    riot_root: Option<&Path>,
 ) -> RtResult<IndexMap<String, RiotVenv>> {
     let loaded = P::load(riotfile_path)?;
-    Ok(normalize_venvs(&loaded.root, loaded.services.as_ref()))
+    Ok(normalize_venvs(&loaded.root, loaded.services.as_ref(), riot_root))
 }
 
 fn normalize_venvs(
     root: &ProviderVenvNode,
     service_map: Option<&ProviderServices>,
+    riot_root: Option<&Path>,
 ) -> IndexMap<String, RiotVenv> {
     let mut venvs = IndexMap::new();
     collect_riot_venvs(root, &ResolvedSpec::default(), &mut venvs, service_map);
     for venv in venvs.values_mut() {
         venv.shared_env = shared_entries(venv.execution_contexts.iter().map(|ctx| &ctx.env));
+        if let Some(riot_root) = riot_root {
+            venv.resolved_pkgs = load_resolved_pkgs(riot_root, &venv.hash);
+        }
+        venv.display_pkgs = build_display_pkgs(&venv.pkgs, &venv.resolved_pkgs);
     }
     venvs
 }
@@ -287,6 +300,87 @@ where
         shared.retain(|key, value| map.get(key).is_some_and(|other| other == value));
     }
     shared
+}
+
+/// Parse a pip-compile lockfile into a map of package name to pinned version.
+///
+/// Lines are expected to follow the `package==version` format produced by
+/// `pip-compile`. Comment lines, blank lines, and extras markers (e.g.
+/// `package[extra]==version`) are handled gracefully.
+fn parse_lockfile(content: &str) -> IndexMap<String, String> {
+    let mut resolved = IndexMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
+            continue;
+        }
+        // Strip trailing inline comments (e.g. "pkg==1.0  # via ...")
+        let line = line.split('#').next().unwrap_or(line).trim();
+        // Strip environment markers after ';'
+        let line = line.split(';').next().unwrap_or(line).trim();
+
+        if let Some((name_part, version)) = line.split_once("==") {
+            // Strip extras: "package[toml]" -> "package"
+            let name = name_part.split('[').next().unwrap_or(name_part).trim();
+            if !name.is_empty() && !version.is_empty() {
+                resolved.insert(name.to_lowercase(), version.to_string());
+            }
+        }
+    }
+    resolved
+}
+
+/// Read and parse the lockfile for a given venv hash from the riot requirements directory.
+/// Returns an empty map if the lockfile does not exist.
+fn load_resolved_pkgs(riot_root: &Path, venv_hash: &str) -> IndexMap<String, String> {
+    let lockfile_path = riot_root
+        .join(REQUIREMENTS_DIR)
+        .join(format!("{venv_hash}.txt"));
+
+    fs::read_to_string(&lockfile_path)
+        .map_or_else(|_| IndexMap::new(), |content| parse_lockfile(&content))
+}
+
+/// Format a single package display version.
+///
+/// Format a display version for a direct (constrained) package.
+///
+/// - Resolved + constraint: `"1.2.3 (>=1.0)"`
+/// - Resolved, no constraint: `"1.2.3 (latest)"`
+/// - No resolved + constraint: `"(>=1.0)"`
+/// - No resolved, no constraint: `"latest"`
+#[must_use]
+pub fn format_display_version(constraint: &str, resolved: Option<&str>) -> String {
+    match (resolved, constraint.is_empty()) {
+        (Some(version), false) => format!("{version} ({constraint})"),
+        (Some(version), true) => format!("{version} (latest)"),
+        (None, false) => format!("({constraint})"),
+        (None, true) => "(latest)".to_string(),
+    }
+}
+
+/// Build display versions for all packages: constrained packages first, then transitive deps.
+fn build_display_pkgs(
+    pkgs: &IndexMap<String, String>,
+    resolved_pkgs: &IndexMap<String, String>,
+) -> IndexMap<String, String> {
+    let mut display = IndexMap::new();
+
+    // Constrained packages
+    for (name, constraint) in pkgs {
+        let resolved = resolved_pkgs.get(&name.to_lowercase()).map(String::as_str);
+        display.insert(name.clone(), format_display_version(constraint, resolved));
+    }
+
+    // Transitive dependencies (in resolved but not in constrained)
+    let constrained: IndexSet<String> = pkgs.keys().map(|k| k.to_lowercase()).collect();
+    for (name, version) in resolved_pkgs {
+        if !constrained.contains(name.as_str()) {
+            display.insert(name.clone(), version.clone());
+        }
+    }
+
+    display
 }
 
 fn pip_deps(pkgs: &IndexMap<String, String>) -> String {
@@ -593,7 +687,7 @@ pub fn select_execution_contexts(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pytest_target;
+    use super::{format_display_version, parse_lockfile, parse_pytest_target};
 
     #[test]
     fn parse_pytest_target_keeps_pytest_node_id() {
@@ -604,5 +698,87 @@ mod tests {
             target.as_deref(),
             Some("tests/data/simple_riotfile.py::Test_Django"),
         );
+    }
+
+    #[test]
+    fn parse_lockfile_standard_format() {
+        let content = "\
+#
+# This file is autogenerated by pip-compile with Python 3.11
+#
+pytest==8.3.3
+requests==2.32.3
+coverage[toml]==7.6.8
+";
+        let resolved = parse_lockfile(content);
+        assert_eq!(resolved.get("pytest"), Some(&"8.3.3".to_string()));
+        assert_eq!(resolved.get("requests"), Some(&"2.32.3".to_string()));
+        // extras should be stripped from the name
+        assert_eq!(resolved.get("coverage"), Some(&"7.6.8".to_string()));
+        assert!(resolved.get("coverage[toml]").is_none());
+    }
+
+    #[test]
+    fn parse_lockfile_ignores_comments_and_blanks() {
+        let content = "\
+# comment line
+
+pytest==1.0.0
+  # indented comment
+";
+        let resolved = parse_lockfile(content);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get("pytest"), Some(&"1.0.0".to_string()));
+    }
+
+    #[test]
+    fn parse_lockfile_empty_content() {
+        let resolved = parse_lockfile("");
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn parse_lockfile_normalizes_names_to_lowercase() {
+        let content = "PyTest==8.0.0\nRequests==2.0.0\n";
+        let resolved = parse_lockfile(content);
+        assert_eq!(resolved.get("pytest"), Some(&"8.0.0".to_string()));
+        assert_eq!(resolved.get("requests"), Some(&"2.0.0".to_string()));
+    }
+
+    #[test]
+    fn parse_lockfile_strips_inline_comments() {
+        let content = "pytest==8.0.0  # via -r requirements.in\n";
+        let resolved = parse_lockfile(content);
+        assert_eq!(resolved.get("pytest"), Some(&"8.0.0".to_string()));
+    }
+
+    #[test]
+    fn parse_lockfile_strips_env_markers() {
+        let content = "colorama==0.4.6 ; sys_platform == \"win32\"\n";
+        let resolved = parse_lockfile(content);
+        assert_eq!(resolved.get("colorama"), Some(&"0.4.6".to_string()));
+    }
+
+    #[test]
+    fn display_version_resolved_with_constraint() {
+        assert_eq!(
+            format_display_version(">=5.0", Some("5.4.3")),
+            "5.4.3 (>=5.0)"
+        );
+    }
+
+    #[test]
+    fn display_version_resolved_no_constraint() {
+        assert_eq!(format_display_version("", Some("1.2.3")), "1.2.3 (latest)");
+    }
+
+    #[test]
+    fn display_version_no_resolved_with_constraint() {
+        assert_eq!(format_display_version(">=5.0", None), "(>=5.0)");
+    }
+
+    #[test]
+    fn display_version_no_resolved_no_constraint() {
+        assert_eq!(format_display_version("", None), "(latest)");
     }
 }

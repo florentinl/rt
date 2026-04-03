@@ -22,8 +22,8 @@ export type RtVenv = {
     name: string;
     python: string;
     pkgs: Record<string, string>;
-    shared_pkgs: Record<string, string>;
-    shared_env: Record<string, string>;
+    resolved_pkgs: Record<string, string>;
+    display_pkgs: Record<string, string>;
     execution_contexts: RtExecutionContext[];
 };
 

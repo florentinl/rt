@@ -25,7 +25,7 @@ use rayon::current_num_threads;
 
 use crate::{
     config::RepoConfig,
-    constants::{DONE_MARKER, REQUIREMENTS_DIR, VENV_DEPS_DIR, VENV_SELF_DIR},
+    constants::{DONE_MARKER, VENV_DEPS_DIR, VENV_SELF_DIR},
     venv::select_execution_contexts,
 };
 
@@ -242,16 +242,11 @@ impl BuildSharedState {
         Ok(StepOutcome::Done)
     }
 
-    fn get_requirements_file(&self, venv: &RiotVenv) -> DynResult<NamedTempFile> {
-        let requirements_txt = self
-            .riot_root
-            .join(REQUIREMENTS_DIR)
-            .join(format!("{}.txt", venv.hash));
-
-        let requirements = if requirements_txt.exists() {
-            fs::read_to_string(requirements_txt)?
-        } else {
+    fn get_requirements_file(venv: &RiotVenv) -> DynResult<NamedTempFile> {
+        let requirements = if venv.resolved_pkgs.is_empty() {
             format_requirements(&venv.pkgs)
+        } else {
+            format_resolved_requirements(&venv.resolved_pkgs)
         }
         .replace("/home/bits/project", ".");
 
@@ -267,7 +262,7 @@ impl BuildSharedState {
         deps_install_path.push(VENV_DEPS_DIR);
         deps_install_path.push(format!("deps_{}", venv.hash));
 
-        let requirements_file = self.get_requirements_file(venv)?;
+        let requirements_file = Self::get_requirements_file(venv)?;
 
         let marker_path = deps_install_path.join(DONE_MARKER);
         if !self.force_reinstall && marker_path.is_file() {
@@ -530,6 +525,24 @@ fn format_requirements(pkgs: &IndexMap<String, String>) -> String {
             buf.push('\n');
         }
         buf.push_str(lib);
+        buf.push_str(version);
+    }
+    buf.push('\n');
+    buf
+}
+
+fn format_resolved_requirements(resolved_pkgs: &IndexMap<String, String>) -> String {
+    if resolved_pkgs.is_empty() {
+        return String::new();
+    }
+
+    let mut buf = String::new();
+    for (idx, (lib, version)) in resolved_pkgs.iter().enumerate() {
+        if idx > 0 {
+            buf.push('\n');
+        }
+        buf.push_str(lib);
+        buf.push_str("==");
         buf.push_str(version);
     }
     buf.push('\n');

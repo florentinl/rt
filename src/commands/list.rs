@@ -34,8 +34,8 @@ struct JsonVenv {
     python: String,
     services: Vec<String>,
     pkgs: IndexMap<String, String>,
-    shared_pkgs: IndexMap<String, String>,
-    shared_env: IndexMap<String, String>,
+    resolved_pkgs: IndexMap<String, String>,
+    display_pkgs: IndexMap<String, String>,
     execution_contexts: Vec<JsonExecutionContext>,
 }
 
@@ -220,9 +220,9 @@ pub fn run(
                     name: venv.name,
                     python: venv.python,
                     pkgs: venv.pkgs,
+                    resolved_pkgs: venv.resolved_pkgs,
+                    display_pkgs: venv.display_pkgs,
                     services: venv.services,
-                    shared_pkgs: venv.shared_pkgs,
-                    shared_env: venv.shared_env,
                     execution_contexts,
                 }
             })

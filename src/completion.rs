@@ -13,7 +13,7 @@ use crate::{
 
 fn get_venvs() -> IndexMap<String, RiotVenv> {
     locate_riotfile(None)
-        .and_then(|path| load_context_with_default_provider(&path))
+        .and_then(|path| load_context_with_default_provider(&path, None))
         .unwrap_or_default()
 }
 

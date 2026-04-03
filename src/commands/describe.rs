@@ -37,7 +37,7 @@ fn describe_venv(repo: &RepoConfig, venv: &RiotVenv) {
         format_path(&relative_venv_path(&repo.riot_root, &venv.hash)),
         2,
     );
-    print_section("packages", 2, || print_packages(&venv.pkgs, 4));
+    print_section("packages", 2, || print_packages(&venv.display_pkgs, 4));
 
     println!("  {}", style_label("execution contexts"));
     if venv.execution_contexts.is_empty() {
@@ -66,22 +66,22 @@ fn describe_venv(repo: &RepoConfig, venv: &RiotVenv) {
     }
 }
 
-fn print_packages(pkgs: &IndexMap<String, String>, indent: usize) {
+fn print_packages(display_pkgs: &IndexMap<String, String>, indent: usize) {
     let pad = " ".repeat(indent);
-    if pkgs.is_empty() {
+    if display_pkgs.is_empty() {
         println!("{}{}", pad, "<none>".attribute(Attribute::Dim));
         return;
     }
 
-    for (name, version) in pkgs {
+    for (name, display_version) in display_pkgs {
         println!(
-            "{}{}{}",
+            "{}{} {}",
             pad,
             name.as_str().bold().yellow(),
-            version
+            display_version
                 .as_str()
                 .with(Color::Magenta)
-                .attribute(Attribute::Dim)
+                .attribute(Attribute::Dim),
         );
     }
 }

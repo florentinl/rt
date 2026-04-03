@@ -46,6 +46,7 @@ export class RiotEnvManager implements EnvironmentManager {
   private readonly statePersistence: StatePersistenceService;
   private readonly currentEnvironment = new Map<string, PythonEnvironment>();
   private readonly knownEnvironments = new Map<string, PythonEnvironment[]>();
+  private readonly knownVenvs = new Map<string, RtVenv[]>();
   private readonly ongoingActivations = new Map<string, AbortController>();
 
   private readonly envsEmitter =
@@ -245,27 +246,23 @@ export class RiotEnvManager implements EnvironmentManager {
   }
 
   /**
-   * Get venv indexes by workspace (for indicator service)
+   * Get venv indexes by workspace (for indicator service), using the cached venv index.
    */
-  async getVenvIndexesByWorkspace(): Promise<Map<string, Map<string, RtVenv>>> {
-    const folders = this.workspaceResolver.getWorkspaceFolders();
+  getVenvIndexesByWorkspace(): Map<string, Map<string, RtVenv>> {
     const indexes = new Map<string, Map<string, RtVenv>>();
 
-    for (const folder of folders) {
-      const venvs = await this.cliService.listEnvironments(folder.fsPath);
-      indexes.set(folder.fsPath, this.buildVenvIndex(venvs));
+    for (const [cwd, venvs] of this.knownVenvs) {
+      indexes.set(cwd, this.buildVenvIndex(venvs));
     }
 
     return indexes;
   }
 
   /**
-   * Get venv by hash (for package manager)
+   * Get venv by hash (for package manager), using the cached venv index.
    */
-  async getVenvByHash(hash: string): Promise<RtVenv | undefined> {
-    const folders = this.workspaceResolver.getWorkspaceFolders();
-    for (const folder of folders) {
-      const venvs = await this.cliService.listEnvironments(folder.fsPath);
+  getVenvByHash(hash: string): RtVenv | undefined {
+    for (const venvs of this.knownVenvs.values()) {
       const venv = this.findVenvByHash(venvs, hash);
       if (venv) {
         return venv;
@@ -331,6 +328,7 @@ export class RiotEnvManager implements EnvironmentManager {
   private async fetchEnvironments(cwd: string): Promise<PythonEnvironment[]> {
     try {
       const venvs = await this.cliService.listEnvironments(cwd);
+      this.knownVenvs.set(cwd, venvs);
       const environments: PythonEnvironment[] = [];
 
       for (const venv of venvs) {
