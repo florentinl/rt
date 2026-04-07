@@ -89,11 +89,10 @@ export class VenvIndicatorService {
 
         for (const venv of venvs) {
           for (const exc of venv.execution_contexts) {
-            const target = exc.pytest_target;
-            if (!target) {
-              continue;
-            }
-            if (this.matchesTarget(relative, target)) {
+            const matched = exc.pytest_targets.some((target) =>
+              this.matchesTarget(relative, target),
+            );
+            if (matched) {
               envs.push(
                 this.buildEnvironment(venv, exc.hash, folder.uri.fsPath),
               );

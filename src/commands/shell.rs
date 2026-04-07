@@ -75,7 +75,7 @@ pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> RtResult
 pub fn make_venv_shell_context(venv: &RiotVenv) -> ExecutionContext {
     ExecutionContext {
         command: None,
-        pytest_target: None,
+        pytest_targets: vec![],
         env: IndexMap::new(),
         create: false,
         skip_dev_install: false,

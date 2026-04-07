@@ -58,7 +58,7 @@ impl RiotVenv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionContext {
     pub command: Option<String>,
-    pub pytest_target: Option<String>,
+    pub pytest_targets: Vec<String>,
     pub env: IndexMap<String, String>,
     pub create: bool,
     pub skip_dev_install: bool,
@@ -74,10 +74,13 @@ impl ExecutionContext {
         base_hash: &str,
         ctx_hash: &str,
     ) -> Self {
-        let pytest_target = command.as_deref().and_then(parse_pytest_target);
+        let pytest_targets = command
+            .as_deref()
+            .map(parse_pytest_targets)
+            .unwrap_or_default();
         Self {
             command,
-            pytest_target,
+            pytest_targets,
             env,
             create,
             skip_dev_install,
@@ -550,10 +553,15 @@ impl RiotHasher {
     }
 }
 
-fn parse_pytest_target(command: &str) -> Option<String> {
-    let tokens = split(command).ok()?;
-    let pytest_idx = tokens.iter().position(|token| token == "pytest")?;
+fn parse_pytest_targets(command: &str) -> Vec<String> {
+    let Some(tokens) = split(command).ok() else {
+        return Vec::new();
+    };
+    let Some(pytest_idx) = tokens.iter().position(|token| token == "pytest") else {
+        return Vec::new();
+    };
 
+    let mut targets = Vec::new();
     for token in tokens.iter().skip(pytest_idx + 1) {
         if token.starts_with('-') || token.contains('{') || Path::new(token).is_absolute() {
             continue;
@@ -567,21 +575,21 @@ fn parse_pytest_target(command: &str) -> Option<String> {
         if (candidate.is_dir() || candidate.extension().is_some_and(|ext| ext == "py"))
             && candidate.exists()
         {
-            return Some(token.clone());
+            targets.push(token.clone());
         }
     }
 
-    None
+    targets
 }
 
-/// Keep only execution contexts whose `pytest_target` prefix-matches the given test target.
+/// Keep only execution contexts whose `pytest_targets` prefix-match the given test target.
 ///
-/// A context matches when its target is a prefix of the query or the query is a prefix of the
-/// target. This allows the user to specify a more precise target than the riotfile (e.g.
+/// A context matches when any of its targets is a prefix of the query or the query is a prefix of
+/// any target. This allows the user to specify a more precise target than the riotfile (e.g.
 /// `tests/contrib/django/test_views.py::TestFoo` matches riotfile target `tests/contrib/django/`).
 fn filter_by_test_target(venv: &mut RiotVenv, test_target: &str) {
     venv.execution_contexts.retain(|ctx| {
-        ctx.pytest_target.as_ref().is_some_and(|target| {
+        ctx.pytest_targets.iter().any(|target| {
             test_target.starts_with(target.as_str()) || target.starts_with(test_target)
         })
     });
@@ -687,16 +695,28 @@ pub fn select_execution_contexts(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_display_version, parse_lockfile, parse_pytest_target};
+    use super::{format_display_version, parse_lockfile, parse_pytest_targets};
 
     #[test]
-    fn parse_pytest_target_keeps_pytest_node_id() {
-        let target =
-            parse_pytest_target("pytest tests/data/simple_riotfile.py::Test_Django {cmdargs}");
+    fn parse_pytest_targets_keeps_pytest_node_id() {
+        let targets =
+            parse_pytest_targets("pytest tests/data/simple_riotfile.py::Test_Django {cmdargs}");
+
+        assert_eq!(targets, vec!["tests/data/simple_riotfile.py::Test_Django"]);
+    }
+
+    #[test]
+    fn parse_pytest_targets_collects_multiple_files() {
+        let targets = parse_pytest_targets(
+            "pytest -vvv {cmdargs} tests/data/simple_riotfile.py tests/data/real_use_riotfile.py",
+        );
 
         assert_eq!(
-            target.as_deref(),
-            Some("tests/data/simple_riotfile.py::Test_Django"),
+            targets,
+            vec![
+                "tests/data/simple_riotfile.py",
+                "tests/data/real_use_riotfile.py",
+            ]
         );
     }
 

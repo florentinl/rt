@@ -19,9 +19,10 @@ export class TestingConfigurationManager {
     const config = vscode.workspace.getConfiguration("python", workspaceFolder);
     const target = vscode.ConfigurationTarget.WorkspaceFolder;
 
-    const pytestArgs = context?.pytest_target
-      ? [context.pytest_target, "--color=yes", "--cov-branch"]
-      : undefined;
+    const pytestArgs =
+      context?.pytest_targets && context.pytest_targets.length > 0
+        ? [...context.pytest_targets, "--color=yes", "--cov-branch"]
+        : undefined;
 
     try {
       await Promise.all([

@@ -10,7 +10,7 @@ export type RtExecutionContext = {
     display_name: string;
     short_display_name: string;
     command?: string;
-    pytest_target?: string;
+    pytest_targets: string[];
     env: Record<string, string>;
     create: boolean;
     skip_dev_install: boolean;
