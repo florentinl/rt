@@ -2,6 +2,12 @@
 
 A VS Code extension that brings [riot](https://github.com/DataDog/riot) virtual environments into the [Python Environments](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-python-envs) UI. Select a riot environment, run tests from the sidebar, get per-file code lenses, and let the extension handle service containers for you.
 
+
+
+https://github.com/user-attachments/assets/b3920bbc-c7b5-4c14-8fdc-4f067fcdd777
+
+
+
 ## Getting Started
 
 ### 1. Install the CLI
