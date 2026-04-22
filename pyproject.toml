@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.13.1,<2"]
 build-backend = "maturin"
 
 [project]
@@ -9,7 +9,7 @@ requires-python = ">=3.9"
 dependencies = ["uv>=0.6", "ruamel.yaml>=0.19.1"]
 
 [dependency-groups]
-dev = ["maturin>=1.7,<2"]
+dev = ["maturin>=1.13.1,<2"]
 
 [project.scripts]
 rt = "rt:main"
