@@ -10,26 +10,7 @@ https://github.com/user-attachments/assets/b3920bbc-c7b5-4c14-8fdc-4f067fcdd777
 
 ## Getting Started
 
-### 1. Install the CLI
-
-The extension relies on the `rt` CLI to discover and build riot environments.
-Install it with your preferred tool manager:
-
-```bash
-# uv (recommended)
-uv tool install "git+ssh://git@github.com/florentinl/rt.git"
-
-# pipx
-pipx install "git+ssh://git@github.com/florentinl/rt.git"
-```
-
-Verify it works:
-
-```bash
-rt --help
-```
-
-### 2. Install the Extension
+### Install the Extension
 
 Download the latest `.vsix` from the [GitHub Releases](https://github.com/florentinl/rt/releases) page, then install it:
 
@@ -46,6 +27,26 @@ Then enable the Python Environments extension in your settings:
 ```
 
 The extension activates automatically when a `riotfile.py` is detected in your workspace.
+
+The VSIX ships with its own bundled `rt` runtime, so no separate install is needed to use the extension.
+
+### (Optional) Install the CLI
+
+If you also want to run `rt` from your terminal, install it with your preferred tool manager:
+
+```bash
+# uv (recommended)
+uv tool install "git+ssh://git@github.com/florentinl/rt.git"
+
+# pipx
+pipx install "git+ssh://git@github.com/florentinl/rt.git"
+```
+
+Verify it works:
+
+```bash
+rt --help
+```
 
 ## Features
 
