@@ -6,7 +6,7 @@
   "version": "1.0.1",
   "repository": "https://github.com/florentinl/rt.git",
   "engines": {
-    "vscode": "^1.109.0"
+    "vscode": "^1.115.0"
   },
   "categories": [
     "Other"
@@ -35,7 +35,8 @@
     ]
   },
   "scripts": {
-    "dist": "npm run package && vsce package",
+    "dist": "npm run package && npm run build-runtime && vsce package",
+    "build-runtime": "bash ./build-runtime.sh",
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
     "watch": "npm-run-all -p watch:*",

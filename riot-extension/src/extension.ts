@@ -20,6 +20,7 @@ export async function activate(context: vscode.ExtensionContext) {
     log,
     extensionId,
     context.workspaceState,
+    context.extensionPath,
   );
   context.subscriptions.push(api.registerEnvironmentManager(envManager));
 

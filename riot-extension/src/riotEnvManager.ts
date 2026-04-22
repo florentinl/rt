@@ -61,12 +61,13 @@ export class RiotEnvManager implements EnvironmentManager {
     log: vscode.LogOutputChannel,
     extensionId: string,
     workspaceState: vscode.Memento,
+    extensionPath?: string,
   ) {
     this.managerId = buildManagerId(extensionId, this.name);
     this.preferredPackageManagerId = buildManagerId(extensionId, "rt");
     this.log = log;
 
-    this.cliService = new RtCliService(log);
+    this.cliService = new RtCliService(log, extensionPath);
     this.workspaceResolver = new WorkspaceResolver();
     this.testingConfigManager = new TestingConfigurationManager(log);
     this.statePersistence = new StatePersistenceService(workspaceState);

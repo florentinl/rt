@@ -3,6 +3,8 @@
  */
 
 import * as cp from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
 import { RtVenv } from "../types/rtTypes";
 
@@ -14,7 +16,14 @@ export interface RtCommandOptions {
 }
 
 export class RtCliService {
-  constructor(private readonly log: vscode.LogOutputChannel) {}
+  private readonly command: string;
+
+  constructor(
+    private readonly log: vscode.LogOutputChannel,
+    extensionPath?: string,
+  ) {
+    this.command = resolveRtCommand(extensionPath, log);
+  }
 
   /**
    * Execute an RT CLI command
@@ -40,9 +49,8 @@ export class RtCliService {
         reject(new vscode.CancellationError());
       };
 
-      const command = "rt";
       child = cp.execFile(
-        command,
+        this.command,
         args,
         {
           cwd: options?.cwd,
@@ -106,4 +114,23 @@ export class RtCliService {
     }
     await this.execute(args, { cwd, signal: options?.signal });
   }
+}
+
+function resolveRtCommand(
+  extensionPath: string | undefined,
+  log: vscode.LogOutputChannel,
+): string {
+  if (extensionPath) {
+    const bundled = path.join(extensionPath, "runtime", "bin", "rt");
+    try {
+      fs.accessSync(bundled, fs.constants.X_OK);
+      log.appendLine(`[riot] Using bundled rt binary at ${bundled}`);
+      return bundled;
+    } catch {
+      log.appendLine(
+        `[riot] Bundled rt binary not found at ${bundled}; falling back to 'rt' on PATH`,
+      );
+    }
+  }
+  return "rt";
 }
