@@ -40,7 +40,13 @@ fn _rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pyfunction]
 fn cli_main(args: Vec<String>) -> u8 {
-    CompleteEnv::with_factory(Cli::command).complete();
+    let current_dir = std::env::current_dir().ok();
+    match CompleteEnv::with_factory(Cli::command).try_complete(args.clone(), current_dir.as_deref())
+    {
+        Ok(true) => return 0,
+        Ok(false) => {}
+        Err(err) => err.exit(),
+    }
 
     match try_main(args) {
         Ok(()) => 0,
