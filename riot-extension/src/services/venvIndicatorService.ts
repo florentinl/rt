@@ -17,7 +17,9 @@ export class VenvIndicatorService {
 
   constructor(
     private readonly api: PythonEnvironmentApi,
-    private readonly getVenvIndexes: () => Map<string, Map<string, RtVenv>>,
+    private readonly getVenvIndexes: () => Promise<
+      Map<string, Map<string, RtVenv>>
+    >,
     private readonly buildEnvironment: (
       venv: RtVenv,
       hash: string,
@@ -41,12 +43,13 @@ export class VenvIndicatorService {
       return;
     }
 
-    const venvIndexes = this.getVenvIndexes();
+    const venvIndexes = await this.getVenvIndexes();
+    this.ctxForFiles.clear();
+
     if (venvIndexes.size === 0) {
+      this.codeLensEmitter.fire();
       return;
     }
-
-    this.ctxForFiles.clear();
 
     // Get unique venvs per workspace
     const venvsByWorkspace = new Map<string, RtVenv[]>();

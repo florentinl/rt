@@ -168,7 +168,7 @@ export class RiotEnvManager implements EnvironmentManager {
     }
 
     this.currentEnvironment.delete(cwd);
-    return this.restoreEnvironment(cwd);
+    return this.restoreEnvironment(cwd, folder);
   }
 
   async resolve(
@@ -247,13 +247,20 @@ export class RiotEnvManager implements EnvironmentManager {
   }
 
   /**
-   * Get venv indexes by workspace (for indicator service), using the cached venv index.
+   * Get venv indexes by workspace for the indicator service.
    */
-  getVenvIndexesByWorkspace(): Map<string, Map<string, RtVenv>> {
+  async getVenvIndexesByWorkspace(): Promise<Map<string, Map<string, RtVenv>>> {
+    const folders = this.workspaceResolver.getWorkspaceFolders();
+    await this.fetchEnvironmentsForFolders(folders);
+
     const indexes = new Map<string, Map<string, RtVenv>>();
 
-    for (const [cwd, venvs] of this.knownVenvs) {
-      indexes.set(cwd, this.buildVenvIndex(venvs));
+    for (const folder of folders) {
+      const cwd = folder.fsPath;
+      const venvs = this.knownVenvs.get(cwd);
+      if (venvs && venvs.length > 0) {
+        indexes.set(cwd, this.buildVenvIndex(venvs));
+      }
     }
 
     return indexes;
@@ -434,6 +441,7 @@ export class RiotEnvManager implements EnvironmentManager {
 
   private async restoreEnvironment(
     cwd: string,
+    folder: vscode.Uri,
   ): Promise<PythonEnvironment | undefined> {
     const savedEnvId = this.statePersistence.getLastEnvironment(cwd);
     if (!savedEnvId) {
@@ -457,6 +465,14 @@ export class RiotEnvManager implements EnvironmentManager {
       await this.statePersistence.saveLastEnvironment(cwd, undefined);
       this.currentEnvironment.delete(cwd);
       return undefined;
+    }
+
+    const ctx = this.findExecutionContextByHash(
+      this.knownVenvs.get(cwd) ?? [],
+      savedEnvId,
+    );
+    if (ctx) {
+      await this.testingConfigManager.updateConfiguration(folder, ctx);
     }
 
     this.currentEnvironment.set(cwd, restored);
@@ -506,6 +522,20 @@ export class RiotEnvManager implements EnvironmentManager {
         return venv;
       }
     }
+    return undefined;
+  }
+
+  private findExecutionContextByHash(
+    venvs: RtVenv[],
+    hash: string,
+  ): RtExecutionContext | undefined {
+    for (const venv of venvs) {
+      const ctx = venv.execution_contexts?.find((c) => c.hash === hash);
+      if (ctx) {
+        return ctx;
+      }
+    }
+
     return undefined;
   }
 
