@@ -3,7 +3,7 @@
   "publisher": "florentinl",
   "displayName": "Riot Python Environments",
   "description": "Python Environments extension plugin for Datadog's Riot venv manager",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "repository": "https://github.com/florentinl/rt.git",
   "engines": {
     "vscode": "^1.120.0"

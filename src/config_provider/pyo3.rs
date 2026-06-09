@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::CString, fs, path::Path};
+use std::{ffi::CString, fs, path::Path};
 
 use indexmap::{IndexMap, IndexSet};
 use pyo3::prelude::*;
@@ -180,7 +180,7 @@ fn load_riotfile(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
 
 fn get_services(py: Python<'_>, project_path: &Path) -> RtResult<Option<ProviderServices>> {
     let python_code = format!(
-        "import sys; sys.path.insert(0, r\"{}\"); from tests.suitespec import SUITESPEC",
+        "import sys; sys.path.insert(0, r\"{}\"); from tests.suitespec import get_suites; SUITES = get_suites()",
         project_path.to_string_lossy()
     );
 
@@ -193,32 +193,32 @@ fn get_services(py: Python<'_>, project_path: &Path) -> RtResult<Option<Provider
 
 fn extract_suitespec_services(py: Python<'_>, code: &CString) -> PyResult<ProviderServices> {
     let module = PyModule::from_code(py, code.as_c_str(), c"get_services", c"_get_service")?;
-    let suitespec = module.getattr("SUITESPEC")?;
-    let suites_obj = suitespec.get_item("suites")?;
+    let suites_obj = module.getattr("SUITES")?;
     let suites: &Bound<'_, PyDict> = suites_obj.cast()?;
 
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+    let mut result = ProviderServices::new();
 
     for (key, value) in suites {
-        let full_name: String = key.extract()?;
-        let suite_name = full_name
-            .split("::")
-            .last()
-            .unwrap_or(&full_name)
-            .to_owned();
-
+        let suite_name: String = key.extract()?;
         let dict: &Bound<'_, PyDict> = value.cast()?;
         let services: Option<Vec<String>> =
             dict.get_item("services")?.and_then(|v| v.extract().ok());
         let snapshot: Option<bool> = dict.get_item("snapshot")?.and_then(|v| v.extract().ok());
+        let pattern: String = dict
+            .get_item("pattern")?
+            .map_or_else(|| Ok(suite_name.clone()), |v| v.extract())?;
 
-        let mut svc_list = services.unwrap_or_default();
+        let mut svc_list = IndexSet::new();
+        for service in services.unwrap_or_default() {
+            svc_list.insert(service);
+        }
         if snapshot.unwrap_or(false) {
-            svc_list.push("testagent".to_owned());
+            svc_list.insert("testagent".to_owned());
         }
 
-        if !svc_list.is_empty() {
-            result.insert(suite_name, svc_list);
+        let services = svc_list.into_iter().collect::<Vec<_>>();
+        if !services.is_empty() {
+            result.entry(pattern).or_default().extend(services);
         }
     }
 

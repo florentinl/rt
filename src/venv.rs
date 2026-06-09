@@ -187,7 +187,13 @@ fn normalize_venvs(
     riot_root: Option<&Path>,
 ) -> IndexMap<String, RiotVenv> {
     let mut venvs = IndexMap::new();
-    collect_riot_venvs(root, &ResolvedSpec::default(), &mut venvs, service_map);
+    let service_patterns = compile_suitespec_services(service_map);
+    collect_riot_venvs(
+        root,
+        &ResolvedSpec::default(),
+        &mut venvs,
+        &service_patterns,
+    );
     for venv in venvs.values_mut() {
         venv.shared_env = shared_entries(venv.execution_contexts.iter().map(|ctx| &ctx.env));
         if let Some(riot_root) = riot_root {
@@ -202,7 +208,7 @@ fn collect_riot_venvs(
     venv: &ProviderVenvNode,
     state: &ResolvedSpec,
     acc: &mut IndexMap<String, RiotVenv>,
-    service_map: Option<&HashMap<String, Vec<String>>>,
+    service_patterns: &[(Regex, &[String])],
 ) {
     let Some(next_state) = state.merge(venv) else {
         return;
@@ -216,6 +222,11 @@ fn collect_riot_venvs(
                 return;
             }
 
+            // Suitespec services are keyed on the venv name, which is invariant
+            // across the python/package expansion below, so resolve them once per
+            // node instead of re-matching every pattern for each instance.
+            let services = suitespec_services_for(service_patterns, name);
+
             for py_version in pys {
                 let interpreter_repr = interpreter_repr(py_version);
                 for pkgs in &pkg_variants {
@@ -224,16 +235,13 @@ fn collect_riot_venvs(
                     let hash =
                         RiotHasher::hash_parts(&[&name_repr, &interpreter_repr, &full_pkg_str]);
 
-                    let services = service_map.map_or_else(Vec::new, |service_map| {
-                        service_map.get(name).cloned().unwrap_or_default()
-                    });
                     let entry = acc.entry(hash.clone()).or_insert_with(|| {
                         RiotVenv::new(
                             name.clone(),
                             py_version.clone(),
                             pkgs.clone(),
                             hash.clone(),
-                            services,
+                            services.clone(),
                         )
                     });
 
@@ -273,8 +281,43 @@ fn collect_riot_venvs(
     }
 
     for child in &venv.venvs {
-        collect_riot_venvs(child, &next_state, acc, service_map);
+        collect_riot_venvs(child, &next_state, acc, service_patterns);
     }
+}
+
+fn compile_suitespec_services(
+    service_map: Option<&ProviderServices>,
+) -> Vec<(Regex, &[String])> {
+    let Some(service_map) = service_map else {
+        return Vec::new();
+    };
+
+    service_map
+        .iter()
+        .filter_map(|(pattern, services)| {
+            Regex::new(pattern)
+                .ok()
+                .map(|regex| (regex, services.as_slice()))
+        })
+        .collect()
+}
+
+fn suitespec_services_for(service_patterns: &[(Regex, &[String])], name: &str) -> Vec<String> {
+    let mut services = IndexSet::new();
+
+    for (regex, pattern_services) in service_patterns {
+        if riot_pattern_matches(regex, name) {
+            services.extend(pattern_services.iter().cloned());
+        }
+    }
+
+    services.into_iter().collect()
+}
+
+fn riot_pattern_matches(regex: &Regex, value: &str) -> bool {
+    regex
+        .find(value)
+        .is_ok_and(|matched| matched.is_some_and(|matched| matched.start() == 0))
 }
 
 fn expand_product(values: &IndexMap<String, Vec<String>>) -> Vec<IndexMap<String, String>> {
@@ -695,7 +738,8 @@ pub fn select_execution_contexts(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_display_version, parse_lockfile, parse_pytest_targets};
+    use super::{format_display_version, normalize_venvs, parse_lockfile, parse_pytest_targets};
+    use crate::config_provider::{ProviderServices, ProviderVenvNode};
 
     #[test]
     fn parse_pytest_targets_keeps_pytest_node_id() {
@@ -718,6 +762,27 @@ mod tests {
                 "tests/data/real_use_riotfile.py",
             ]
         );
+    }
+
+    #[test]
+    fn services_match_suitespec_pattern_with_riot_match_semantics() {
+        let root = ProviderVenvNode {
+            name: Some("integration-snapshot".to_owned()),
+            pys: vec!["3.12".to_owned()],
+            ..ProviderVenvNode::default()
+        };
+        let service_rules = ProviderServices::from([
+            ("snapshot".to_owned(), vec!["redis".to_owned()]),
+            (
+                "integration-snapshot*".to_owned(),
+                vec!["testagent".to_owned()],
+            ),
+        ]);
+
+        let venvs = normalize_venvs(&root, Some(&service_rules), None);
+        let venv = venvs.values().next().unwrap();
+
+        assert_eq!(venv.services, vec!["testagent"]);
     }
 
     #[test]
