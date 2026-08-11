@@ -67,6 +67,6 @@
     "ms-python.vscode-python-envs"
   ],
   "dependencies": {
-    "@vscode/vsce": "^3.7.1"
+    "@vscode/vsce": "^3.9.2"
   }
 }
