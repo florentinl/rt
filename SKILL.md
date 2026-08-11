@@ -107,6 +107,9 @@ Use `--force-reinstall` after:
 
 Otherwise just re-run — caching handles it. If native imports fail, you can try rebuilding as well.
 
+Upgrading `rt` itself needs no flag: every cached directory records the `rt`
+version that produced it and is rebuilt automatically when that version changes.
+
 ## Troubleshooting
 
 ```bash

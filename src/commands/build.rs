@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as FmtWrite,
-    fs::{self, File},
+    fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -26,7 +26,7 @@ use rayon::current_num_threads;
 
 use crate::{
     config::RepoConfig,
-    constants::{DONE_MARKER, VENV_DEPS_DIR, VENV_SELF_DIR},
+    constants::{DONE_MARKER, RT_VERSION, VENV_DEPS_DIR, VENV_SELF_DIR},
     venv::select_execution_contexts,
 };
 
@@ -202,7 +202,7 @@ impl BuildSharedState {
         let dev_install_path = get_dev_install_path(&self.riot_root, python, self.no_editable);
 
         let marker_path = dev_install_path.join(DONE_MARKER);
-        if !self.force_reinstall && marker_path.is_file() {
+        if self.can_reuse(&marker_path, ctx) {
             return Ok(StepOutcome::Cached);
         }
 
@@ -237,7 +237,7 @@ impl BuildSharedState {
             )));
         }
 
-        File::create(marker_path)?;
+        write_marker(&marker_path)?;
 
         Ok(StepOutcome::Done)
     }
@@ -270,7 +270,7 @@ impl BuildSharedState {
         let requirements_file = Self::get_requirements_file(venv)?;
 
         let marker_path = deps_install_path.join(DONE_MARKER);
-        if !self.force_reinstall && marker_path.is_file() {
+        if self.can_reuse(&marker_path, ctx) {
             return Ok(StepOutcome::Cached);
         }
 
@@ -309,7 +309,7 @@ impl BuildSharedState {
             )));
         }
 
-        File::create(marker_path)?;
+        write_marker(&marker_path)?;
 
         Ok(StepOutcome::Done)
     }
@@ -323,7 +323,7 @@ impl BuildSharedState {
         let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
         let marker_path = exc_venv_path.join(DONE_MARKER);
 
-        if !self.force_reinstall && marker_path.is_file() {
+        if self.can_reuse(&marker_path, ctx) {
             return Ok(StepOutcome::Cached);
         }
 
@@ -370,9 +370,37 @@ impl BuildSharedState {
         bin_sources.push(&deps_install_path);
         merge_bin_dirs(&exc_venv_path, &bin_sources)?;
 
-        File::create(marker_path)?;
+        write_marker(&marker_path)?;
 
         Ok(StepOutcome::Done)
+    }
+
+    /// Whether the directory guarded by `marker_path` can be reused as-is.
+    ///
+    /// A directory is only reusable when it was produced by this exact `rt`
+    /// version. When a marker from another version is found the reason is
+    /// reported, otherwise the rebuild would look like an unexplained cache
+    /// miss.
+    fn can_reuse(&self, marker_path: &Path, ctx: &StepContext) -> bool {
+        if self.force_reinstall {
+            return false;
+        }
+
+        match read_marker(marker_path) {
+            MarkerState::Current => true,
+            MarkerState::Missing => false,
+            MarkerState::Stale(previous) => {
+                let previous = previous.map_or_else(
+                    || "an unversioned rt build".to_owned(),
+                    |version| format!("rt {version}"),
+                );
+                ctx.sink.append_output(
+                    &ctx.step_id,
+                    format!("cache built by {previous}, rebuilding for rt {RT_VERSION}\n"),
+                );
+                false
+            }
+        }
     }
 
     fn configure_site_packages(
@@ -537,6 +565,40 @@ impl BuildSharedState {
         fs::write(sitecustomize_path, sc)?;
         Ok(())
     }
+}
+
+/// State of a `DONE_MARKER` relative to the running `rt` version.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkerState {
+    /// Written by this exact `rt` version: the cached build is reusable.
+    Current,
+    /// No marker at all: nothing was ever built here.
+    Missing,
+    /// Written by another `rt` version, or by a version that did not stamp
+    /// itself yet (empty marker, `rt` <= 1.0.2).
+    Stale(Option<String>),
+}
+
+fn read_marker(marker_path: &Path) -> MarkerState {
+    let Ok(contents) = fs::read_to_string(marker_path) else {
+        return if marker_path.is_file() {
+            // Present but unreadable (or not UTF-8): treat as untrusted.
+            MarkerState::Stale(None)
+        } else {
+            MarkerState::Missing
+        };
+    };
+
+    let stamp = contents.trim();
+    if stamp == RT_VERSION {
+        MarkerState::Current
+    } else {
+        MarkerState::Stale((!stamp.is_empty()).then(|| stamp.to_owned()))
+    }
+}
+
+fn write_marker(marker_path: &Path) -> io::Result<()> {
+    fs::write(marker_path, format!("{RT_VERSION}\n"))
 }
 
 /// Normalize a requirement name the way PEP 503 does, so `Types_Mock` and
@@ -743,9 +805,13 @@ fn rewrite_python_shebang(content: &[u8], python_shebang: &str) -> Option<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use super::{extra_requirements, has_pkg, normalize_pkg_name};
+    use super::{
+        MarkerState, extra_requirements, has_pkg, normalize_pkg_name, read_marker, write_marker,
+    };
+    use crate::constants::{DONE_MARKER, RT_VERSION};
     use crate::venv::RiotVenv;
     use indexmap::IndexMap;
+    use std::fs;
 
     fn venv_with(pkgs: &[(&str, &str)], resolved: &[(&str, &str)]) -> RiotVenv {
         let mut venv = RiotVenv::empty_for_tests();
@@ -783,6 +849,48 @@ mod tests {
     fn venvs_without_mock_get_no_extras() {
         let venv = venv_with(&[("pytest", "")], &[("pytest-mock", "3.12.0")]);
         assert!(extra_requirements(&venv).is_empty());
+    }
+
+    #[test]
+    fn marker_written_by_this_version_is_reusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(DONE_MARKER);
+
+        write_marker(&marker).unwrap();
+
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), RT_VERSION);
+        assert_eq!(read_marker(&marker), MarkerState::Current);
+    }
+
+    #[test]
+    fn marker_from_another_version_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(DONE_MARKER);
+        fs::write(&marker, "0.9.0\n").unwrap();
+
+        assert_eq!(
+            read_marker(&marker),
+            MarkerState::Stale(Some("0.9.0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn legacy_empty_marker_is_stale_without_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(DONE_MARKER);
+        fs::write(&marker, "").unwrap();
+
+        assert_eq!(read_marker(&marker), MarkerState::Stale(None));
+    }
+
+    #[test]
+    fn absent_marker_is_missing_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            read_marker(&dir.path().join(DONE_MARKER)),
+            MarkerState::Missing
+        );
     }
 
     #[test]
