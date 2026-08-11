@@ -62,6 +62,14 @@ When you select an environment, the extension configures `python.testing.pytestA
 
 Test files (`tests/**/test_*.py`) get a clickable code lens allowing to select the riot environments that apply. Click it to quick-pick an environment scoped to that file.
 
+### Typed `envier` Settings
+
+`envier` ships no `py.typed` marker, so every setting declared through it shows
+up as untyped in the editor. The `rt` runtime embeds a vendored `types-envier`
+stub package and drops it into each environment that gets `envier` - class
+access resolves to `EnvVariable[T]`, instance access to `T`. Nothing to install:
+see `vendor/types-envier/VENDORING.md`.
+
 ### Service Containers
 
 Environments that declare services in `tests/suitespec.py` (including the `testagent` snapshot service) are wired up automatically. The extension injects a pytest plugin that starts and stops the right containers around your test run.

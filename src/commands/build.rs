@@ -354,13 +354,13 @@ impl BuildSharedState {
 
         let site_packages_path =
             exc_venv_path.join(format!("lib/python{}/site-packages", &venv.python));
+
         self.configure_site_packages(
+            venv,
             exc,
             &deps_install_path,
             dev_install_path.as_ref(),
             &site_packages_path,
-            &venv.services,
-            &venv.suite_env,
         )?;
 
         let mut bin_sources: Vec<&Path> = Vec::new();
@@ -405,12 +405,11 @@ impl BuildSharedState {
 
     fn configure_site_packages(
         &self,
+        venv: &RiotVenv,
         exc: &ExecutionContext,
         deps_install_path: &Path,
         dev_install_path: Option<&PathBuf>,
         site_packages_path: &Path,
-        services: &[String],
-        suite_env: &IndexMap<String, String>,
     ) -> RtResult<()> {
         fs::create_dir_all(site_packages_path)?;
 
@@ -450,13 +449,21 @@ impl BuildSharedState {
             )?;
         }
 
+        // envier is a ddtrace runtime dependency, so it lands in the venv
+        // through the dev install rather than through a riotfile package. The
+        // rare venv that skips the dev install only has it when the riotfile
+        // asks for it explicitly.
+        if !exc.skip_dev_install || has_pkg(venv, "envier") {
+            write_envier_stubs(site_packages_path)?;
+        }
+
         self.write_sitecustomize(
             site_packages_path,
             current_dir,
             &paths,
             exc,
-            services,
-            suite_env,
+            &venv.services,
+            &venv.suite_env,
         )?;
 
         Ok(())
@@ -565,6 +572,45 @@ impl BuildSharedState {
         fs::write(sitecustomize_path, sc)?;
         Ok(())
     }
+}
+
+/// Vendored `types-envier` stub package, embedded at compile time.
+///
+/// `envier` ships no `py.typed` and no inline annotations, so every setting
+/// declared through it resolves to an untyped attribute in the editor. The
+/// stubs are a PEP 561 stub-only package: a plain `envier-stubs` directory next
+/// to the real package is all a type checker needs, so there is nothing to
+/// install and nothing to resolve over the network.
+///
+/// See `vendor/types-envier/VENDORING.md` for provenance and update steps.
+const ENVIER_STUBS: &[(&str, &str)] = &[
+    (
+        "__init__.pyi",
+        include_str!("../../vendor/types-envier/envier-stubs/__init__.pyi"),
+    ),
+    (
+        "env.pyi",
+        include_str!("../../vendor/types-envier/envier-stubs/env.pyi"),
+    ),
+    (
+        "mypy.pyi",
+        include_str!("../../vendor/types-envier/envier-stubs/mypy.pyi"),
+    ),
+    (
+        "validators.pyi",
+        include_str!("../../vendor/types-envier/envier-stubs/validators.pyi"),
+    ),
+];
+
+fn write_envier_stubs(site_packages_path: &Path) -> RtResult<()> {
+    let stubs_path = site_packages_path.join("envier-stubs");
+    fs::create_dir_all(&stubs_path)?;
+
+    for (name, contents) in ENVIER_STUBS {
+        fs::write(stubs_path.join(name), contents)?;
+    }
+
+    Ok(())
 }
 
 /// State of a `DONE_MARKER` relative to the running `rt` version.
@@ -806,7 +852,8 @@ fn rewrite_python_shebang(content: &[u8], python_shebang: &str) -> Option<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        MarkerState, extra_requirements, has_pkg, normalize_pkg_name, read_marker, write_marker,
+        ENVIER_STUBS, MarkerState, extra_requirements, has_pkg, normalize_pkg_name, read_marker,
+        write_envier_stubs, write_marker,
     };
     use crate::constants::{DONE_MARKER, RT_VERSION};
     use crate::venv::RiotVenv;
@@ -849,6 +896,38 @@ mod tests {
     fn venvs_without_mock_get_no_extras() {
         let venv = venv_with(&[("pytest", "")], &[("pytest-mock", "3.12.0")]);
         assert!(extra_requirements(&venv).is_empty());
+    }
+
+    #[test]
+    fn envier_stubs_are_written_as_a_pep561_stub_package() {
+        let dir = tempfile::tempdir().unwrap();
+
+        write_envier_stubs(dir.path()).unwrap();
+
+        let stubs = dir.path().join("envier-stubs");
+        assert!(stubs.join("__init__.pyi").is_file());
+        assert!(stubs.join("env.pyi").is_file());
+        assert!(stubs.join("mypy.pyi").is_file());
+        assert!(stubs.join("validators.pyi").is_file());
+
+        // The vendored copies must stay verbatim so upstream stubtest results
+        // remain comparable.
+        let env_stub = fs::read_to_string(stubs.join("env.pyi")).unwrap();
+        assert!(env_stub.contains("class EnvVariable(Generic[T]):"));
+    }
+
+    #[test]
+    fn every_vendored_stub_is_embedded_and_non_empty() {
+        assert_eq!(ENVIER_STUBS.len(), 4);
+        for (name, contents) in ENVIER_STUBS {
+            assert!(
+                std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext == "pyi"),
+                "unexpected stub file: {name}"
+            );
+            assert!(!contents.trim().is_empty(), "empty stub file: {name}");
+        }
     }
 
     #[test]
