@@ -4,7 +4,8 @@ use std::{
     fs::{self, File},
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    process::{Command, Stdio},
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -198,8 +199,7 @@ impl BuildSharedState {
     }
 
     fn ensure_dev_install(&self, python: &str, ctx: &StepContext) -> DynResult<StepOutcome> {
-        let dev_install_path =
-            get_dev_install_path(&self.riot_root, python, self.no_editable);
+        let dev_install_path = get_dev_install_path(&self.riot_root, python, self.no_editable);
 
         let marker_path = dev_install_path.join(DONE_MARKER);
         if !self.force_reinstall && marker_path.is_file() {
@@ -243,12 +243,17 @@ impl BuildSharedState {
     }
 
     fn get_requirements_file(venv: &RiotVenv) -> DynResult<NamedTempFile> {
-        let requirements = if venv.resolved_pkgs.is_empty() {
+        let mut requirements = if venv.resolved_pkgs.is_empty() {
             format_requirements(&venv.pkgs)
         } else {
             format_resolved_requirements(&venv.resolved_pkgs)
         }
         .replace("/home/bits/project", ".");
+
+        for extra in extra_requirements(venv) {
+            requirements.push_str(&extra);
+            requirements.push('\n');
+        }
 
         let mut temp = Builder::new().suffix(".txt").tempfile()?;
         temp.write_all(requirements.as_bytes())?;
@@ -274,7 +279,19 @@ impl BuildSharedState {
         }
         fs::create_dir_all(&deps_install_path)?;
 
-        let status = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
+        let mut cmd = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone());
+
+        // pylibmc has no wheels: it compiles against libmemcached, which the CI
+        // image installs system-wide (libmemcached-dev). On developer machines
+        // the headers usually live under a Homebrew prefix, so point the build
+        // at it. Applied before build_env so rt.toml can still override it.
+        if has_pkg(venv, "pylibmc")
+            && let Some(prefix) = libmemcached_prefix()
+        {
+            cmd = cmd.env("LIBMEMCACHED", prefix);
+        }
+
+        let status = cmd
             .envs(self.build_env.as_ref())
             .arg("install")
             .arg("--system")
@@ -315,8 +332,11 @@ impl BuildSharedState {
         }
 
         let deps_install_path = get_deps_install_path(&self.riot_root, &venv.hash);
-        let dev_install_path = (!exc.skip_dev_install)
-            .then_some(get_dev_install_path(&self.riot_root, &venv.python, self.no_editable));
+        let dev_install_path = (!exc.skip_dev_install).then_some(get_dev_install_path(
+            &self.riot_root,
+            &venv.python,
+            self.no_editable,
+        ));
 
         let status = ManagedCommand::new_uv("venv", Arc::clone(&ctx.sink), ctx.step_id.clone())
             .envs(self.build_env.as_ref())
@@ -495,7 +515,7 @@ impl BuildSharedState {
         if services.iter().any(|svc| svc == "testagent") {
             writeln!(
                 sc,
-                "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # configure testagent url because testagent service is enable"
+                "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # default testagent url; pytest_rt refines it from the published compose port"
             )?;
         }
 
@@ -517,6 +537,89 @@ impl BuildSharedState {
         fs::write(sitecustomize_path, sc)?;
         Ok(())
     }
+}
+
+/// Normalize a requirement name the way PEP 503 does, so `Types_Mock` and
+/// `types-mock` compare equal.
+fn normalize_pkg_name(name: &str) -> String {
+    name.split('[')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_lowercase()
+        .replace(['_', '.'], "-")
+}
+
+/// Whether `pkg` is part of this venv, either declared in the riotfile or
+/// pulled in by the compiled lockfile.
+fn has_pkg(venv: &RiotVenv, pkg: &str) -> bool {
+    let target = normalize_pkg_name(pkg);
+    venv.pkgs
+        .keys()
+        .chain(venv.resolved_pkgs.keys())
+        .any(|name| normalize_pkg_name(name) == target)
+}
+
+/// Requirements `rt` adds on top of the riotfile ones.
+///
+/// `mock` ships no inline types, so IDE/type-checker integrations report every
+/// `mock` import as untyped unless the stubs are installed next to it.
+fn extra_requirements(venv: &RiotVenv) -> Vec<String> {
+    let mut extras = Vec::new();
+
+    if has_pkg(venv, "mock") && !has_pkg(venv, "types-mock") {
+        extras.push("types-mock".to_owned());
+    }
+
+    extras
+}
+
+/// Locate a libmemcached installation for building `pylibmc`.
+///
+/// Resolution order: an explicit `LIBMEMCACHED` in the environment, then
+/// `brew --prefix libmemcached`, then the well-known Homebrew prefixes.
+fn libmemcached_prefix() -> Option<String> {
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+
+    PREFIX
+        .get_or_init(|| {
+            if let Some(prefix) = std::env::var_os("LIBMEMCACHED")
+                && !prefix.is_empty()
+            {
+                return Some(prefix.to_string_lossy().into_owned());
+            }
+
+            brew_prefix("libmemcached")
+                .into_iter()
+                .chain(
+                    [
+                        "/opt/homebrew/opt/libmemcached",
+                        "/usr/local/opt/libmemcached",
+                        "/opt/homebrew",
+                        "/usr/local",
+                    ]
+                    .into_iter()
+                    .map(PathBuf::from),
+                )
+                .find(|candidate| candidate.join("include/libmemcached/memcached.h").is_file())
+                .map(|prefix| prefix.to_string_lossy().into_owned())
+        })
+        .clone()
+}
+
+fn brew_prefix(formula: &str) -> Option<PathBuf> {
+    let output = Command::new("brew")
+        .args(["--prefix", formula])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let prefix = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!prefix.is_empty()).then(|| PathBuf::from(prefix))
 }
 
 fn get_dev_install_path(riot_root: &Path, python: &str, no_editable: bool) -> PathBuf {
@@ -636,4 +739,56 @@ fn rewrite_python_shebang(content: &[u8], python_shebang: &str) -> Option<Vec<u8
     rewritten.extend_from_slice(python_shebang.as_bytes());
     rewritten.extend_from_slice(rest);
     Some(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extra_requirements, has_pkg, normalize_pkg_name};
+    use crate::venv::RiotVenv;
+    use indexmap::IndexMap;
+
+    fn venv_with(pkgs: &[(&str, &str)], resolved: &[(&str, &str)]) -> RiotVenv {
+        let mut venv = RiotVenv::empty_for_tests();
+        venv.pkgs = pkgs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect::<IndexMap<_, _>>();
+        venv.resolved_pkgs = resolved
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect::<IndexMap<_, _>>();
+        venv
+    }
+
+    #[test]
+    fn pkg_names_are_normalized_like_pep503() {
+        assert_eq!(normalize_pkg_name("Types_Mock"), "types-mock");
+        assert_eq!(normalize_pkg_name("coverage[toml]"), "coverage");
+        assert_eq!(normalize_pkg_name("ruamel.yaml"), "ruamel-yaml");
+    }
+
+    #[test]
+    fn mock_pulls_in_its_stubs() {
+        let venv = venv_with(&[("mock", ""), ("pytest", "")], &[]);
+        assert_eq!(extra_requirements(&venv), vec!["types-mock".to_owned()]);
+    }
+
+    #[test]
+    fn mock_stubs_are_not_duplicated() {
+        let venv = venv_with(&[("mock", "")], &[("types-mock", "5.2.0")]);
+        assert!(extra_requirements(&venv).is_empty());
+    }
+
+    #[test]
+    fn venvs_without_mock_get_no_extras() {
+        let venv = venv_with(&[("pytest", "")], &[("pytest-mock", "3.12.0")]);
+        assert!(extra_requirements(&venv).is_empty());
+    }
+
+    #[test]
+    fn pkgs_are_detected_in_the_lockfile_too() {
+        let venv = venv_with(&[("django-pylibmc", ">=0.6,<0.7")], &[("pylibmc", "1.6.3")]);
+        assert!(has_pkg(&venv, "pylibmc"));
+        assert!(!has_pkg(&venv, "memcache"));
+    }
 }
