@@ -33,6 +33,7 @@ struct JsonVenv {
     name: String,
     python: String,
     services: Vec<String>,
+    suite_env: IndexMap<String, String>,
     pkgs: IndexMap<String, String>,
     resolved_pkgs: IndexMap<String, String>,
     display_pkgs: IndexMap<String, String>,
@@ -95,7 +96,11 @@ fn unique_packages(venv: &RiotVenv) -> IndexMap<String, String> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    if diff.is_empty() { venv.pkgs.clone() } else { diff }
+    if diff.is_empty() {
+        venv.pkgs.clone()
+    } else {
+        diff
+    }
 }
 
 fn context_env_diff(ctx: &ExecutionContext, venv: &RiotVenv) -> IndexMap<String, String> {
@@ -110,10 +115,7 @@ fn context_env_diff(ctx: &ExecutionContext, venv: &RiotVenv) -> IndexMap<String,
         .collect()
 }
 
-fn build_display_names(
-    venv: &RiotVenv,
-    ctx: &ExecutionContext,
-) -> (String, String) {
+fn build_display_names(venv: &RiotVenv, ctx: &ExecutionContext) -> (String, String) {
     let pkg_detail = format_entries(&unique_packages(venv), 2);
     let env_detail = format_entries(&context_env_diff(ctx, venv), 2);
 
@@ -196,8 +198,7 @@ pub fn run(
                     .map(|ctx| {
                         let ctx_venv_path =
                             venv_path(&repo.riot_root, &ctx.hash).display().to_string();
-                        let (display_name, short_display_name) =
-                            build_display_names(&venv, ctx);
+                        let (display_name, short_display_name) = build_display_names(&venv, ctx);
                         JsonExecutionContext {
                             hash: ctx.hash.clone(),
                             python_path: python_path(&ctx_venv_path),
@@ -223,6 +224,7 @@ pub fn run(
                     resolved_pkgs: venv.resolved_pkgs,
                     display_pkgs: venv.display_pkgs,
                     services: venv.services,
+                    suite_env: venv.suite_env,
                     execution_contexts,
                 }
             })

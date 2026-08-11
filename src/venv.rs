@@ -11,7 +11,7 @@ use shell_words::split;
 
 use crate::{
     config::Selector,
-    config_provider::{ConfigProvider, ProviderServices, ProviderVenvNode},
+    config_provider::{ConfigProvider, ProviderSuite, ProviderSuites, ProviderVenvNode},
     constants::{REQUIREMENTS_DIR, VENV_PREFIX},
     error::{RtError, RtResult},
 };
@@ -27,6 +27,11 @@ pub struct RiotVenv {
     pub display_pkgs: IndexMap<String, String>,
     pub hash: String,
     pub services: Vec<String>,
+    /// Environment variables declared by the matching suitespec suites.
+    ///
+    /// `scripts/run-tests` exports these before handing over to riot, so they
+    /// must be visible to the test process as well.
+    pub suite_env: IndexMap<String, String>,
     pub execution_contexts: Vec<ExecutionContext>,
     pub shared_pkgs: IndexMap<String, String>,
     pub shared_env: IndexMap<String, String>,
@@ -39,6 +44,7 @@ impl RiotVenv {
         pkgs: IndexMap<String, String>,
         hash: String,
         services: Vec<String>,
+        suite_env: IndexMap<String, String>,
     ) -> Self {
         Self {
             name,
@@ -48,10 +54,24 @@ impl RiotVenv {
             display_pkgs: IndexMap::new(),
             hash,
             services,
+            suite_env,
             execution_contexts: Vec::new(),
             shared_pkgs: IndexMap::new(),
             shared_env: IndexMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn empty_for_tests() -> Self {
+        Self::new(
+            String::new(),
+            String::new(),
+            IndexMap::new(),
+            String::new(),
+            Vec::new(),
+            IndexMap::new(),
+        )
     }
 }
 
@@ -178,16 +198,20 @@ pub fn load_context<P: ConfigProvider>(
     riot_root: Option<&Path>,
 ) -> RtResult<IndexMap<String, RiotVenv>> {
     let loaded = P::load(riotfile_path)?;
-    Ok(normalize_venvs(&loaded.root, loaded.services.as_ref(), riot_root))
+    Ok(normalize_venvs(
+        &loaded.root,
+        loaded.suites.as_ref(),
+        riot_root,
+    ))
 }
 
 fn normalize_venvs(
     root: &ProviderVenvNode,
-    service_map: Option<&ProviderServices>,
+    suite_map: Option<&ProviderSuites>,
     riot_root: Option<&Path>,
 ) -> IndexMap<String, RiotVenv> {
     let mut venvs = IndexMap::new();
-    let service_patterns = compile_suitespec_services(service_map);
+    let service_patterns = compile_suitespec_suites(suite_map);
     collect_riot_venvs(
         root,
         &ResolvedSpec::default(),
@@ -208,7 +232,7 @@ fn collect_riot_venvs(
     venv: &ProviderVenvNode,
     state: &ResolvedSpec,
     acc: &mut IndexMap<String, RiotVenv>,
-    service_patterns: &[(Regex, &[String])],
+    service_patterns: &[(Regex, &ProviderSuite)],
 ) {
     let Some(next_state) = state.merge(venv) else {
         return;
@@ -222,10 +246,10 @@ fn collect_riot_venvs(
                 return;
             }
 
-            // Suitespec services are keyed on the venv name, which is invariant
-            // across the python/package expansion below, so resolve them once per
+            // Suitespec metadata is keyed on the venv name, which is invariant
+            // across the python/package expansion below, so resolve it once per
             // node instead of re-matching every pattern for each instance.
-            let services = suitespec_services_for(service_patterns, name);
+            let (services, suite_env) = suitespec_for(service_patterns, name);
 
             for py_version in pys {
                 let interpreter_repr = interpreter_repr(py_version);
@@ -242,6 +266,7 @@ fn collect_riot_venvs(
                             pkgs.clone(),
                             hash.clone(),
                             services.clone(),
+                            suite_env.clone(),
                         )
                     });
 
@@ -285,33 +310,56 @@ fn collect_riot_venvs(
     }
 }
 
-fn compile_suitespec_services(
-    service_map: Option<&ProviderServices>,
-) -> Vec<(Regex, &[String])> {
-    let Some(service_map) = service_map else {
+fn compile_suitespec_suites(suite_map: Option<&ProviderSuites>) -> Vec<(Regex, &ProviderSuite)> {
+    let Some(suite_map) = suite_map else {
         return Vec::new();
     };
 
-    service_map
+    suite_map
         .iter()
-        .filter_map(|(pattern, services)| {
-            Regex::new(pattern)
-                .ok()
-                .map(|regex| (regex, services.as_slice()))
-        })
+        .filter_map(|(pattern, suite)| Regex::new(pattern).ok().map(|regex| (regex, suite)))
         .collect()
 }
 
-fn suitespec_services_for(service_patterns: &[(Regex, &[String])], name: &str) -> Vec<String> {
+/// Resolve the services and environment variables of every suitespec suite
+/// matching `name`.
+fn suitespec_for(
+    service_patterns: &[(Regex, &ProviderSuite)],
+    name: &str,
+) -> (Vec<String>, IndexMap<String, String>) {
     let mut services = IndexSet::new();
+    let mut env = IndexMap::new();
 
-    for (regex, pattern_services) in service_patterns {
+    for (regex, suite) in service_patterns {
         if riot_pattern_matches(regex, name) {
-            services.extend(pattern_services.iter().cloned());
+            services.extend(suite.services.iter().cloned());
+            env.extend(
+                suite
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         }
     }
 
-    services.into_iter().collect()
+    let services: Vec<String> = services.into_iter().collect();
+    localize_service_hosts(&mut env, &services);
+    (services, env)
+}
+
+/// Rewrite `*_HOST` variables that point at a compose service to `localhost`.
+///
+/// Suitespec host values (e.g. `TEST_REDIS_HOST: redis`) are compose service
+/// DNS names, which only resolve from inside the `testrunner` container used by
+/// `scripts/ddtest`. `rt` always runs the tests on the host, where the services
+/// are reachable through their published ports, so apply the same rewrite that
+/// `scripts/run-tests` performs for its host-networked (podman) mode.
+fn localize_service_hosts(env: &mut IndexMap<String, String>, services: &[String]) {
+    for (key, value) in env.iter_mut() {
+        if key.ends_with("_HOST") && services.iter().any(|service| service == value) {
+            "localhost".clone_into(value);
+        }
+    }
 }
 
 fn riot_pattern_matches(regex: &Regex, value: &str) -> bool {
@@ -739,7 +787,18 @@ pub fn select_execution_contexts(
 #[cfg(test)]
 mod tests {
     use super::{format_display_version, normalize_venvs, parse_lockfile, parse_pytest_targets};
-    use crate::config_provider::{ProviderServices, ProviderVenvNode};
+    use crate::config_provider::{ProviderSuite, ProviderSuites, ProviderVenvNode};
+    use indexmap::IndexMap;
+
+    fn suite(services: &[&str], env: &[(&str, &str)]) -> ProviderSuite {
+        ProviderSuite {
+            services: services.iter().map(|s| (*s).to_owned()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<IndexMap<_, _>>(),
+        }
+    }
 
     #[test]
     fn parse_pytest_targets_keeps_pytest_node_id() {
@@ -771,11 +830,11 @@ mod tests {
             pys: vec!["3.12".to_owned()],
             ..ProviderVenvNode::default()
         };
-        let service_rules = ProviderServices::from([
-            ("snapshot".to_owned(), vec!["redis".to_owned()]),
+        let service_rules = ProviderSuites::from([
+            ("snapshot".to_owned(), suite(&["redis"], &[])),
             (
                 "integration-snapshot*".to_owned(),
-                vec!["testagent".to_owned()],
+                suite(&["testagent"], &[]),
             ),
         ]);
 
@@ -783,6 +842,50 @@ mod tests {
         let venv = venvs.values().next().unwrap();
 
         assert_eq!(venv.services, vec!["testagent"]);
+    }
+
+    #[test]
+    fn suitespec_env_is_attached_and_service_hosts_are_localized() {
+        let root = ProviderVenvNode {
+            name: Some("flask".to_owned()),
+            pys: vec!["3.12".to_owned()],
+            ..ProviderVenvNode::default()
+        };
+        let service_rules = ProviderSuites::from([(
+            "flask".to_owned(),
+            suite(
+                &["memcached", "redis"],
+                &[
+                    ("TEST_MEMCACHED_HOST", "memcached"),
+                    ("TEST_REDIS_HOST", "redis"),
+                    ("TEST_HTTPBIN_PORT", "8001"),
+                    ("TEST_OTHER_HOST", "not-a-service"),
+                ],
+            ),
+        )]);
+
+        let venvs = normalize_venvs(&root, Some(&service_rules), None);
+        let venv = venvs.values().next().unwrap();
+
+        assert_eq!(venv.services, vec!["memcached", "redis"]);
+        assert_eq!(
+            venv.suite_env.get("TEST_MEMCACHED_HOST"),
+            Some(&"localhost".to_owned())
+        );
+        assert_eq!(
+            venv.suite_env.get("TEST_REDIS_HOST"),
+            Some(&"localhost".to_owned())
+        );
+        // Ports are published 1:1 on the host, so they are passed through.
+        assert_eq!(
+            venv.suite_env.get("TEST_HTTPBIN_PORT"),
+            Some(&"8001".to_owned())
+        );
+        // Hosts that are not compose services are left untouched.
+        assert_eq!(
+            venv.suite_env.get("TEST_OTHER_HOST"),
+            Some(&"not-a-service".to_owned())
+        );
     }
 
     #[test]

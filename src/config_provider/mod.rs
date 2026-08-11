@@ -6,10 +6,21 @@ use indexmap::IndexMap;
 
 use crate::error::RtResult;
 
-pub use pyo3::Pyo3ConfigProvider;
 pub use pyo3::PyVenv;
+pub use pyo3::Pyo3ConfigProvider;
 
-pub type ProviderServices = HashMap<String, Vec<String>>;
+/// Suitespec metadata attached to a suite pattern.
+///
+/// Mirrors the fields `scripts/run-tests` reads out of `tests/suitespec.py`:
+/// `services` (plus `testagent` when `snapshot` is set) and `env`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderSuite {
+    pub services: Vec<String>,
+    pub env: IndexMap<String, String>,
+}
+
+/// Map of suitespec `pattern` -> suite metadata.
+pub type ProviderSuites = HashMap<String, ProviderSuite>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ProviderVenvNode {
@@ -26,7 +37,7 @@ pub struct ProviderVenvNode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub root: ProviderVenvNode,
-    pub services: Option<ProviderServices>,
+    pub suites: Option<ProviderSuites>,
 }
 
 pub trait ConfigProvider {

@@ -37,6 +37,12 @@ fn describe_venv(repo: &RepoConfig, venv: &RiotVenv) {
         format_path(&relative_venv_path(&repo.riot_root, &venv.hash)),
         2,
     );
+    if !venv.services.is_empty() {
+        print_kv("services", venv.services.join(", ").bold().green(), 2);
+    }
+    if !venv.suite_env.is_empty() {
+        print_section("suitespec env", 2, || print_env_block(&venv.suite_env, 4));
+    }
     print_section("packages", 2, || print_packages(&venv.display_pkgs, 4));
 
     println!("  {}", style_label("execution contexts"));

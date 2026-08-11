@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyIterator, PyModule, PyString, PyStringMethods};
 
 use crate::{
-    config_provider::{ConfigProvider, LoadedConfig, ProviderServices, ProviderVenvNode},
+    config_provider::{ConfigProvider, LoadedConfig, ProviderSuites, ProviderVenvNode},
     error::{RtError, RtResult},
 };
 
@@ -88,9 +88,9 @@ impl ConfigProvider for Pyo3ConfigProvider {
             py.import("gc")?.call_method0("disable")?;
 
             let root = load_riotfile(py, riotfile_path)?;
-            let services = get_services(py, project_path)?;
+            let suites = get_suites(py, project_path)?;
 
-            Ok(LoadedConfig { root, services })
+            Ok(LoadedConfig { root, suites })
         })
     }
 }
@@ -178,7 +178,7 @@ fn load_riotfile(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
     Ok(venv.into())
 }
 
-fn get_services(py: Python<'_>, project_path: &Path) -> RtResult<Option<ProviderServices>> {
+fn get_suites(py: Python<'_>, project_path: &Path) -> RtResult<Option<ProviderSuites>> {
     let python_code = format!(
         "import sys; sys.path.insert(0, r\"{}\"); from tests.suitespec import get_suites; SUITES = get_suites()",
         project_path.to_string_lossy()
@@ -188,15 +188,15 @@ fn get_services(py: Python<'_>, project_path: &Path) -> RtResult<Option<Provider
         return Ok(None);
     };
 
-    Ok(extract_suitespec_services(py, &code_cstr).ok())
+    Ok(extract_suitespec_suites(py, &code_cstr).ok())
 }
 
-fn extract_suitespec_services(py: Python<'_>, code: &CString) -> PyResult<ProviderServices> {
+fn extract_suitespec_suites(py: Python<'_>, code: &CString) -> PyResult<ProviderSuites> {
     let module = PyModule::from_code(py, code.as_c_str(), c"get_services", c"_get_service")?;
     let suites_obj = module.getattr("SUITES")?;
     let suites: &Bound<'_, PyDict> = suites_obj.cast()?;
 
-    let mut result = ProviderServices::new();
+    let mut result = ProviderSuites::new();
 
     for (key, value) in suites {
         let suite_name: String = key.extract()?;
@@ -216,13 +216,42 @@ fn extract_suitespec_services(py: Python<'_>, code: &CString) -> PyResult<Provid
             svc_list.insert("testagent".to_owned());
         }
 
+        let env = dict
+            .get_item("env")?
+            .as_ref()
+            .map(extract_suite_env)
+            .transpose()?
+            .unwrap_or_default();
+
         let services = svc_list.into_iter().collect::<Vec<_>>();
-        if !services.is_empty() {
-            result.entry(pattern).or_default().extend(services);
+        if services.is_empty() && env.is_empty() {
+            continue;
         }
+
+        let entry = result.entry(pattern).or_default();
+        entry.services.extend(services);
+        entry.env.extend(env);
     }
 
     Ok(result)
+}
+
+/// Stringify a suitespec `env` mapping.
+///
+/// Suitespec values come from YAML so they may be booleans or integers
+/// (e.g. `snapshot`-style flags or `PORT: 9126`). `scripts/run-tests` coerces
+/// them with `str(value)`, so do exactly the same here.
+fn extract_suite_env(value: &Bound<'_, PyAny>) -> PyResult<IndexMap<String, String>> {
+    let dict: &Bound<'_, PyDict> = value.cast()?;
+    let mut env = IndexMap::with_capacity(dict.len());
+    for (key, value) in dict {
+        if value.is_none() {
+            continue;
+        }
+        let key: String = key.extract()?;
+        env.insert(key, value.str()?.to_str()?.to_owned());
+    }
+    Ok(env)
 }
 
 // ---------------------------------------------------------------------------

@@ -340,6 +340,7 @@ impl BuildSharedState {
             dev_install_path.as_ref(),
             &site_packages_path,
             &venv.services,
+            &venv.suite_env,
         )?;
 
         let mut bin_sources: Vec<&Path> = Vec::new();
@@ -361,6 +362,7 @@ impl BuildSharedState {
         dev_install_path: Option<&PathBuf>,
         site_packages_path: &Path,
         services: &[String],
+        suite_env: &IndexMap<String, String>,
     ) -> RtResult<()> {
         fs::create_dir_all(site_packages_path)?;
 
@@ -400,7 +402,14 @@ impl BuildSharedState {
             )?;
         }
 
-        self.write_sitecustomize(site_packages_path, current_dir, &paths, exc, services)?;
+        self.write_sitecustomize(
+            site_packages_path,
+            current_dir,
+            &paths,
+            exc,
+            services,
+            suite_env,
+        )?;
 
         Ok(())
     }
@@ -413,6 +422,7 @@ impl BuildSharedState {
         paths: &[(std::borrow::Cow<'_, str>, &str)],
         exc: &ExecutionContext,
         services: &[String],
+        suite_env: &IndexMap<String, String>,
     ) -> RtResult<()> {
         let sitecustomize_path = site_packages_path.join("sitecustomize.py");
         let mut sc = String::new();
@@ -439,6 +449,17 @@ impl BuildSharedState {
                 sc,
                 "sys.path.append(r\"{project_root_str}\")  # test helpers still importable, but last"
             )?;
+        }
+
+        // environment variables from tests/suitespec.yml, exported by
+        // scripts/run-tests before it hands over to riot. riotfile.py env vars
+        // are applied after these so they keep winning, exactly like riot
+        // overriding the inherited process environment.
+        if !suite_env.is_empty() {
+            sc.push_str("\n# Environment variables from tests/suitespec.yml\n");
+            for (key, val) in suite_env {
+                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
+            }
         }
 
         // environment variables from riotfile.py
