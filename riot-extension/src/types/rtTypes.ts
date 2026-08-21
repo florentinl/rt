@@ -21,6 +21,8 @@ export type RtVenv = {
     venv_path: string;
     name: string;
     python: string;
+    services: string[];
+    suite_env: Record<string, string>;
     pkgs: Record<string, string>;
     resolved_pkgs: Record<string, string>;
     display_pkgs: Record<string, string>;

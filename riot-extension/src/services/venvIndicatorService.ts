@@ -7,9 +7,10 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { PythonEnvironment, PythonEnvironmentApi } from "../api";
 import { RtVenv } from "../types/rtTypes";
+import { matchesPytestTarget } from "./pytestTargets";
 
 export class VenvIndicatorService {
-  private readonly ctxForFiles = new Map<string, PythonEnvironment[]>();
+  private readonly venvsByWorkspace = new Map<string, RtVenv[]>();
   private readonly codeLensEmitter = new vscode.EventEmitter<void>();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly selectCommandId: string;
@@ -34,83 +35,28 @@ export class VenvIndicatorService {
     this.registerCodeLensProvider();
   }
 
-  /**
-   * Refresh indicators by scanning for test files and matching environments
-   */
+  /** Refresh the Riot index used to compute indicators for open files. */
   async refresh(): Promise<void> {
     const workspaceFolders = vscode.workspace.workspaceFolders;
+    this.venvsByWorkspace.clear();
     if (!workspaceFolders || workspaceFolders.length === 0) {
-      return;
-    }
-
-    const venvIndexes = await this.getVenvIndexes();
-    this.ctxForFiles.clear();
-
-    if (venvIndexes.size === 0) {
       this.codeLensEmitter.fire();
       return;
     }
 
-    // Get unique venvs per workspace
-    const venvsByWorkspace = new Map<string, RtVenv[]>();
+    const venvIndexes = await this.getVenvIndexes();
     for (const folder of workspaceFolders) {
       const index = venvIndexes.get(folder.uri.fsPath);
       if (index && index.size > 0) {
-        venvsByWorkspace.set(folder.uri.fsPath, this.normalizeTargets(index));
-      }
-    }
-
-    // Find all test files matching the pattern
-    const pattern = "**/tests/**/test_*.py";
-    const filesByWorkspace = await Promise.all(
-      workspaceFolders.map(async (folder) => ({
-        folder,
-        files: await vscode.workspace.findFiles(
-          new vscode.RelativePattern(folder, pattern),
-        ),
-      })),
-    );
-
-    // Match test files to execution contexts
-    for (const { folder, files } of filesByWorkspace) {
-      const venvs = venvsByWorkspace.get(folder.uri.fsPath);
-      if (!venvs || venvs.length === 0) {
-        continue;
-      }
-
-      for (const file of files) {
-        const workspaceFolder = vscode.workspace.getWorkspaceFolder(file);
-        if (
-          !workspaceFolder ||
-          workspaceFolder.uri.fsPath !== folder.uri.fsPath
-        ) {
-          continue;
-        }
-
-        const relative = path.relative(folder.uri.fsPath, file.fsPath);
-        const envs: PythonEnvironment[] = [];
-
-        for (const venv of venvs) {
-          for (const exc of venv.execution_contexts) {
-            const matched = exc.pytest_targets.some((target) =>
-              this.matchesTarget(relative, target),
-            );
-            if (matched) {
-              envs.push(
-                this.buildEnvironment(venv, exc.hash, folder.uri.fsPath),
-              );
-            }
-          }
-        }
-
-        if (envs.length > 0) {
-          this.ctxForFiles.set(file.fsPath, envs);
-        }
+        this.venvsByWorkspace.set(
+          folder.uri.fsPath,
+          this.normalizeTargets(index),
+        );
       }
     }
 
     this.codeLensEmitter.fire();
-    this.log.appendLine("[riot] File venv indicators refreshed.");
+    this.log.appendLine("[riot] File venv index refreshed.");
   }
 
   /**
@@ -125,7 +71,34 @@ export class VenvIndicatorService {
    * Get environments for a file
    */
   getEnvironmentsForFile(filePath: string): PythonEnvironment[] | undefined {
-    return this.ctxForFiles.get(filePath);
+    const uri = vscode.Uri.file(filePath);
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+    if (!workspaceFolder) {
+      return undefined;
+    }
+
+    const workspace = workspaceFolder.uri.fsPath;
+    const venvs = this.venvsByWorkspace.get(workspace);
+    if (!venvs) {
+      return undefined;
+    }
+
+    const relative = path.relative(workspace, filePath);
+    const environments: PythonEnvironment[] = [];
+    for (const venv of venvs) {
+      for (const context of venv.execution_contexts) {
+        if (
+          context.pytest_targets.some((target) =>
+            matchesPytestTarget(relative, target),
+          )
+        ) {
+          environments.push(
+            this.buildEnvironment(venv, context.hash, workspace),
+          );
+        }
+      }
+    }
+    return environments.length > 0 ? environments : undefined;
   }
 
   /**
@@ -168,7 +141,7 @@ export class VenvIndicatorService {
           return;
         }
 
-        const envs = this.ctxForFiles.get(uri.fsPath);
+        const envs = this.getEnvironmentsForFile(uri.fsPath);
         if (!envs || envs.length === 0) {
           void vscode.window.showInformationMessage(
             'No Riot environments found for this file. Run "Riot: Refresh Venv Indicators" to refresh.',
@@ -189,7 +162,7 @@ export class VenvIndicatorService {
     const provider: vscode.CodeLensProvider = {
       onDidChangeCodeLenses: this.codeLensEmitter.event,
       provideCodeLenses: (document) => {
-        const envs = this.ctxForFiles.get(document.uri.fsPath);
+        const envs = this.getEnvironmentsForFile(document.uri.fsPath);
         if (!envs || envs.length === 0) {
           return [];
         }
@@ -221,19 +194,4 @@ export class VenvIndicatorService {
     return Array.from(unique.values());
   }
 
-  /**
-   * Check if a file path matches a pytest target
-   */
-  private matchesTarget(relativePath: string, target: string): boolean {
-    const rel = path.normalize(relativePath);
-    const normalizedTarget = path
-      .normalize(target)
-      .replace(new RegExp(`${path.sep}+$`), "");
-    if (normalizedTarget === "" || normalizedTarget === ".") {
-      return true;
-    }
-    return (
-      rel === normalizedTarget || rel.startsWith(normalizedTarget + path.sep)
-    );
-  }
 }

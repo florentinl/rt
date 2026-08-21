@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { getEnvExtApi } from "./pythonEnvsApi";
+import { PythonEnvironments } from "./api";
 import { RiotEnvManager } from "./riotEnvManager";
 import { RiotPackageManager } from "./riotPackageManager";
 import { VenvIndicatorService } from "./services/venvIndicatorService";
@@ -7,7 +7,7 @@ import { registerCommands } from "./commands";
 
 // This method is called when your extension is activated
 export async function activate(context: vscode.ExtensionContext) {
-  const api = await getEnvExtApi();
+  const api = await PythonEnvironments.api();
   const extensionId = context.extension.id;
 
   const log = vscode.window.createOutputChannel("Riot Environment Manager", {
@@ -16,16 +16,15 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(log);
 
   log.appendLine("Riot Environment Manager activating...");
-  const envManager = new RiotEnvManager(
-    log,
-    extensionId,
-    context.workspaceState,
-    context.extensionPath,
+  const envManager = new RiotEnvManager(log, extensionId, context.extensionPath);
+  context.subscriptions.push(
+    api.registerEnvironmentManager(envManager, { extensionId }),
   );
-  context.subscriptions.push(api.registerEnvironmentManager(envManager));
 
   const pkgManager = new RiotPackageManager(log, envManager, extensionId);
-  context.subscriptions.push(api.registerPackageManager(pkgManager));
+  context.subscriptions.push(
+    api.registerPackageManager(pkgManager, { extensionId }),
+  );
 
   // Set up venv indicator service
   const venvIndicatorService = new VenvIndicatorService(
@@ -42,7 +41,6 @@ export async function activate(context: vscode.ExtensionContext) {
   );
   context.subscriptions.push(venvIndicatorService);
 
-  await venvIndicatorService.refresh();
   const refreshVenvIndicators = vscode.commands.registerCommand(
     "riot.refreshVenvIndicators",
     async () => venvIndicatorService.refresh(),
@@ -51,6 +49,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Register all commands
   registerCommands(context, api, envManager, extensionId);
+
+  void venvIndicatorService.refresh().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    log.error(`Failed to refresh Riot file indicators: ${message}`);
+  });
 
   log.appendLine(
     "Riot Environment Manager registered with Python Environments API.",

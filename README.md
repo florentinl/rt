@@ -62,6 +62,14 @@ When you select an environment, the extension configures `python.testing.pytestA
 
 Test files (`tests/**/test_*.py`) get a clickable code lens allowing to select the riot environments that apply. Click it to quick-pick an environment scoped to that file.
 
+### Package Visibility
+
+The Python Environments view shows the installed version of every package in a
+Riot environment. Packages declared in `riotfile.py` are shown as direct
+dependencies, while packages coming from the resolved lockfile are marked as
+transitive. Riot environments remain read-only in VS Code: edit `riotfile.py`
+and refresh or rebuild instead of installing or removing packages in place.
+
 ### Typed `envier` Settings
 
 `envier` ships no `py.typed` marker, so every setting declared through it shows
@@ -81,5 +89,5 @@ Open the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) and type **Riot** to s
 | Command | Description |
 |---|---|
 | **Riot: Force Reinstall Selected Environment** | Tears down and rebuilds the currently selected environment from scratch. Useful after changing native dependencies or when the venv is in a bad state. |
-| **Riot: Refresh Riot Venv Indicators** | Re-scans test files and updates the code lenses. Run this after editing `riotfile.py` or adding new test files. |
+| **Riot: Refresh Riot Venv Indicators** | Refreshes the Riot environment index used by code lenses. Run this after editing `riotfile.py`. |
 | **Riot: Select Riot Environment for Current File** | Shows a quick-pick of environments whose pytest target matches the file you have open. |

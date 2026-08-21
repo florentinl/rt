@@ -89,6 +89,22 @@ export class WorkspaceResolver {
     return [];
   }
 
+  /** Resolve every workspace affected by a selection update. */
+  getWorkspaceFoldersForSetScope(
+    scope: SetEnvironmentScope,
+    environment?: PythonEnvironment,
+  ): vscode.Uri[] {
+    if (Array.isArray(scope)) {
+      const folders = scope
+        .map((uri) => vscode.workspace.getWorkspaceFolder(uri)?.uri)
+        .filter((uri): uri is vscode.Uri => uri !== undefined);
+      return this.uniqueUris(folders);
+    }
+
+    const folder = this.getWorkspaceFolder(scope, environment);
+    return folder ? [folder] : [];
+  }
+
   /**
    * Extract URI from various scope types
    */
@@ -102,5 +118,9 @@ export class WorkspaceResolver {
       return scope[0];
     }
     return undefined;
+  }
+
+  private uniqueUris(uris: vscode.Uri[]): vscode.Uri[] {
+    return Array.from(new Map(uris.map((uri) => [uri.toString(), uri])).values());
   }
 }

@@ -4,8 +4,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME="$HERE/runtime"
 
-PY_VERSION="3.14.4"
-PBS_TAG="20260414"
+PY_VERSION="3.14.7"
+PBS_TAG="20260814"
 
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)              TRIPLE="aarch64-apple-darwin" ;;

@@ -75,6 +75,8 @@ docs/_build/
 
 # VSCode Extension
 node_modules/
+riot-extension/out/
+riot-extension/.vscode-test/
 
 # Extension runtime (bundled artifacts)
 riot-extension/rt
