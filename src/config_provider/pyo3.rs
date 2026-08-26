@@ -88,7 +88,7 @@ impl ConfigProvider for Pyo3ConfigProvider {
             py.import("gc")?.call_method0("disable")?;
 
             let root = load_riotfile(py, riotfile_path)?;
-            let suites = get_suites(py, project_path)?;
+            let suites = get_suites(py, project_path);
 
             Ok(LoadedConfig { root, suites })
         })
@@ -158,6 +158,30 @@ impl From<PyVenv> for ProviderVenvNode {
 // ---------------------------------------------------------------------------
 
 fn load_riotfile(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
+    // This provider intentionally keeps the lightweight constructor shim. The
+    // default provider uses the real Riot package, so install the shim only for
+    // the duration of this module execution and restore any imported Riot
+    // module afterwards.
+    let sys = py.import("sys")?;
+    let modules_object = sys.getattr("modules")?;
+    let modules: &Bound<'_, PyDict> = modules_object.cast().map_err(PyErr::from)?;
+    let previous_riot = modules.get_item("riot")?;
+    let shim = PyModule::new(py, "riot")?;
+    shim.add("Venv", py.get_type::<PyVenv>())?;
+    modules.set_item("riot", &shim)?;
+
+    let result = load_riotfile_with_installed_shim(py, path);
+
+    if let Some(previous_riot) = previous_riot {
+        modules.set_item("riot", previous_riot)?;
+    } else {
+        modules.del_item("riot")?;
+    }
+
+    result
+}
+
+fn load_riotfile_with_installed_shim(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
     let source = fs::read_to_string(path)?;
     let source_cstr = CString::new(source)?;
     let module_name = CString::new(
@@ -178,17 +202,15 @@ fn load_riotfile(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
     Ok(venv.into())
 }
 
-fn get_suites(py: Python<'_>, project_path: &Path) -> RtResult<Option<ProviderSuites>> {
+pub(super) fn get_suites(py: Python<'_>, project_path: &Path) -> Option<ProviderSuites> {
     let python_code = format!(
         "import sys; sys.path.insert(0, r\"{}\"); from tests.suitespec import get_suites; SUITES = get_suites()",
         project_path.to_string_lossy()
     );
 
-    let Some(code_cstr) = CString::new(python_code).ok() else {
-        return Ok(None);
-    };
+    let code_cstr = CString::new(python_code).ok()?;
 
-    Ok(extract_suitespec_suites(py, &code_cstr).ok())
+    extract_suitespec_suites(py, &code_cstr).ok()
 }
 
 fn extract_suitespec_suites(py: Python<'_>, code: &CString) -> PyResult<ProviderSuites> {

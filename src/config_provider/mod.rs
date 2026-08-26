@@ -1,4 +1,8 @@
+// Kept as the lightweight constructor-only fallback while the Riot-backed
+// provider is the default.
+#[allow(dead_code)]
 mod pyo3;
+mod riot;
 
 use std::{collections::HashMap, path::Path};
 
@@ -7,7 +11,9 @@ use indexmap::IndexMap;
 use crate::error::RtResult;
 
 pub use pyo3::PyVenv;
+#[allow(unused_imports)]
 pub use pyo3::Pyo3ConfigProvider;
+pub use riot::RiotConfigProvider;
 
 /// Suitespec metadata attached to a suite pattern.
 ///

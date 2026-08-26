@@ -29,7 +29,7 @@ use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 
-type DefaultConfigProvider = crate::config_provider::Pyo3ConfigProvider;
+type DefaultConfigProvider = crate::config_provider::RiotConfigProvider;
 
 #[pymodule]
 fn _rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -390,6 +390,13 @@ fn try_main(args: Vec<String>) -> RtResult<()> {
 
     let riotfile_path = locate_riotfile(cli.file.as_ref())?;
     let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
+
+    // Cleaning only needs the cache root. In particular, it must remain usable
+    // when the project's Python configuration is temporarily broken.
+    if matches!(&cli.command, Commands::Clean) {
+        return commands::clean::run(&riot_root);
+    }
+
     let riot_venvs = load_context_with_default_provider(&riotfile_path, Some(&riot_root))?;
 
     let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
