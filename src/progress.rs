@@ -11,17 +11,17 @@ use rayon::{ThreadPoolBuilder, iter::IntoParallelIterator, iter::ParallelIterato
 use crate::display::{DisplayManager, StepStatus, strip_ansi};
 
 /// Identifier for a task/step displayed to the user.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct StepId(String);
 
 impl StepId {
     #[must_use]
-    pub fn new(id: impl Into<String>) -> Self {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -44,14 +44,6 @@ pub fn summarize_errors<E: Display>(errors: &[(String, E)], phase: &str) -> bool
     true
 }
 
-/// Outcome reported by a task.
-#[derive(Clone, Copy, Debug)]
-pub enum StepOutcome {
-    Done,
-    #[allow(dead_code)]
-    Cached,
-}
-
 /// Context passed to tasks so they can emit output through the configured sink.
 #[derive(Clone)]
 pub struct StepContext {
@@ -60,7 +52,7 @@ pub struct StepContext {
 }
 
 /// Indicates how a logger wants command output to be delivered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OutputPolicy {
     /// Pipe child stdout/stderr directly to the parent terminal (no capture).
     Inherit,
@@ -88,14 +80,14 @@ pub trait ProgressLogger: Send + Sync {
 }
 
 /// Guard that ensures a step ends with a terminal status.
-pub struct StepGuard {
+struct StepGuard {
     sink: Arc<dyn ProgressLogger>,
     id: StepId,
     finished: bool,
 }
 
 impl StepGuard {
-    pub fn new(sink: Arc<dyn ProgressLogger>, id: StepId) -> Self {
+    fn new(sink: Arc<dyn ProgressLogger>, id: StepId) -> Self {
         Self {
             sink,
             id,
@@ -103,15 +95,11 @@ impl StepGuard {
         }
     }
 
-    pub fn done(mut self) {
+    fn done(mut self) {
         self.finish_with(StepStatus::Done);
     }
 
-    pub fn cached(mut self) {
-        self.finish_with(StepStatus::Cached);
-    }
-
-    pub fn fail(mut self) {
+    fn fail(mut self) {
         self.finish_with(StepStatus::Failed);
     }
 
@@ -144,7 +132,7 @@ impl MultiplexedProgressLogger {
     /// # Errors
     ///
     /// Returns an error if the terminal display cannot be initialized.
-    pub fn new() -> std::io::Result<Self> {
+    pub(crate) fn new() -> std::io::Result<Self> {
         Ok(Self {
             display: Arc::new(DisplayManager::new()?),
             partial_lines: Mutex::new(HashMap::new()),
@@ -283,7 +271,6 @@ impl ProgressLogger for PlainProgressLogger {
             let elapsed = state.started_at.map(|t| format_duration(t.elapsed()));
             let status_str = match status {
                 StepStatus::Done => "done",
-                StepStatus::Cached => "cached",
                 StepStatus::Failed => "FAILED",
                 StepStatus::Running | StepStatus::Pending => return,
             };
@@ -332,13 +319,13 @@ impl ProgressLogger for PlainProgressLogger {
 pub struct Task<'a, E> {
     pub id: StepId,
     pub label: String,
-    pub exec: Box<dyn FnOnce(StepContext) -> Result<StepOutcome, E> + Send + 'a>,
+    pub exec: Box<dyn FnOnce(StepContext) -> Result<(), E> + Send + 'a>,
 }
 
 impl<'a, E> Task<'a, E> {
-    pub fn new<F>(id: StepId, label: impl Into<String>, exec: F) -> Self
+    pub(crate) fn new<F>(id: StepId, label: impl Into<String>, exec: F) -> Self
     where
-        F: FnOnce(StepContext) -> Result<StepOutcome, E> + Send + 'a,
+        F: FnOnce(StepContext) -> Result<(), E> + Send + 'a,
     {
         Self {
             id,
@@ -356,7 +343,7 @@ pub struct TaskRunner {
 
 impl TaskRunner {
     #[must_use]
-    pub fn new(sink: Arc<dyn ProgressLogger>) -> Self {
+    pub(crate) fn new(sink: Arc<dyn ProgressLogger>) -> Self {
         Self {
             sink,
             parallelism: None,
@@ -364,7 +351,7 @@ impl TaskRunner {
     }
 
     #[must_use]
-    pub const fn with_parallelism(mut self, parallelism: Option<usize>) -> Self {
+    pub(crate) const fn with_parallelism(mut self, parallelism: Option<usize>) -> Self {
         self.parallelism = parallelism;
         self
     }
@@ -374,7 +361,7 @@ impl TaskRunner {
     /// # Errors
     ///
     /// Returns an error if the Rayon thread pool cannot be constructed.
-    pub fn run<'a, E>(
+    pub(crate) fn run<'a, E>(
         &self,
         tasks: Vec<Task<'a, E>>,
     ) -> Result<Vec<(String, E)>, rayon::ThreadPoolBuildError>
@@ -397,12 +384,8 @@ impl TaskRunner {
             });
 
             match result {
-                Ok(StepOutcome::Done) => {
+                Ok(()) => {
                     guard.done();
-                    None
-                }
-                Ok(StepOutcome::Cached) => {
-                    guard.cached();
                     None
                 }
                 Err(err) => {

@@ -11,9 +11,9 @@ use shell_words::split;
 
 use crate::{
     config::Selector,
-    config_provider::{ConfigProvider, ProviderSuite, ProviderSuites, ProviderVenvNode},
     constants::{REQUIREMENTS_DIR, VENV_PREFIX},
     error::{RtError, RtResult},
+    riot_config::{self, RiotSuite, RiotSuites, RiotVenvNode},
 };
 
 #[derive(Clone)]
@@ -63,7 +63,7 @@ impl RiotVenv {
 
     #[cfg(test)]
     #[must_use]
-    pub fn empty_for_tests() -> Self {
+    pub(crate) fn empty_for_tests() -> Self {
         Self::new(
             String::new(),
             String::new(),
@@ -122,7 +122,7 @@ pub fn venv_python_path(riot_root: &Path, short_hash: &str) -> String {
         .to_string()
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 struct ResolvedSpec {
     name: Option<String>,
     command: Option<String>,
@@ -134,7 +134,7 @@ struct ResolvedSpec {
 }
 
 impl ResolvedSpec {
-    fn merge(&self, venv: &ProviderVenvNode) -> Option<Self> {
+    fn merge(&self, venv: &RiotVenvNode) -> Option<Self> {
         let mut next = self.clone();
 
         if let Some(name) = &venv.name {
@@ -193,11 +193,11 @@ impl ResolvedSpec {
     }
 }
 
-pub fn load_context<P: ConfigProvider>(
+pub fn load_context(
     riotfile_path: &Path,
     riot_root: Option<&Path>,
 ) -> RtResult<IndexMap<String, RiotVenv>> {
-    let loaded = P::load(riotfile_path)?;
+    let loaded = riot_config::load(riotfile_path)?;
     Ok(normalize_venvs(
         &loaded.root,
         loaded.suites.as_ref(),
@@ -206,8 +206,8 @@ pub fn load_context<P: ConfigProvider>(
 }
 
 fn normalize_venvs(
-    root: &ProviderVenvNode,
-    suite_map: Option<&ProviderSuites>,
+    root: &RiotVenvNode,
+    suite_map: Option<&RiotSuites>,
     riot_root: Option<&Path>,
 ) -> IndexMap<String, RiotVenv> {
     let mut venvs = IndexMap::new();
@@ -229,10 +229,10 @@ fn normalize_venvs(
 }
 
 fn collect_riot_venvs(
-    venv: &ProviderVenvNode,
+    venv: &RiotVenvNode,
     state: &ResolvedSpec,
     acc: &mut IndexMap<String, RiotVenv>,
-    service_patterns: &[(Regex, &ProviderSuite)],
+    service_patterns: &[(Regex, &RiotSuite)],
 ) {
     let Some(next_state) = state.merge(venv) else {
         return;
@@ -310,7 +310,7 @@ fn collect_riot_venvs(
     }
 }
 
-fn compile_suitespec_suites(suite_map: Option<&ProviderSuites>) -> Vec<(Regex, &ProviderSuite)> {
+fn compile_suitespec_suites(suite_map: Option<&RiotSuites>) -> Vec<(Regex, &RiotSuite)> {
     let Some(suite_map) = suite_map else {
         return Vec::new();
     };
@@ -324,7 +324,7 @@ fn compile_suitespec_suites(suite_map: Option<&ProviderSuites>) -> Vec<(Regex, &
 /// Resolve the services and environment variables of every suitespec suite
 /// matching `name`.
 fn suitespec_for(
-    service_patterns: &[(Regex, &ProviderSuite)],
+    service_patterns: &[(Regex, &RiotSuite)],
     name: &str,
 ) -> (Vec<String>, IndexMap<String, String>) {
     let mut services = IndexSet::new();
@@ -444,7 +444,7 @@ fn load_resolved_pkgs(riot_root: &Path, venv_hash: &str) -> IndexMap<String, Str
 /// - No resolved + constraint: `"(>=1.0)"`
 /// - No resolved, no constraint: `"latest"`
 #[must_use]
-pub fn format_display_version(constraint: &str, resolved: Option<&str>) -> String {
+fn format_display_version(constraint: &str, resolved: Option<&str>) -> String {
     match (resolved, constraint.is_empty()) {
         (Some(version), false) => format!("{version} ({constraint})"),
         (Some(version), true) => format!("{version} (latest)"),
@@ -787,11 +787,11 @@ pub fn select_execution_contexts(
 #[cfg(test)]
 mod tests {
     use super::{format_display_version, normalize_venvs, parse_lockfile, parse_pytest_targets};
-    use crate::config_provider::{ProviderSuite, ProviderSuites, ProviderVenvNode};
+    use crate::riot_config::{RiotSuite, RiotSuites, RiotVenvNode};
     use indexmap::IndexMap;
 
-    fn suite(services: &[&str], env: &[(&str, &str)]) -> ProviderSuite {
-        ProviderSuite {
+    fn suite(services: &[&str], env: &[(&str, &str)]) -> RiotSuite {
+        RiotSuite {
             services: services.iter().map(|s| (*s).to_owned()).collect(),
             env: env
                 .iter()
@@ -802,35 +802,26 @@ mod tests {
 
     #[test]
     fn parse_pytest_targets_keeps_pytest_node_id() {
-        let targets =
-            parse_pytest_targets("pytest tests/data/simple_riotfile.py::Test_Django {cmdargs}");
+        let targets = parse_pytest_targets("pytest rt/__init__.py::Test_Django {cmdargs}");
 
-        assert_eq!(targets, vec!["tests/data/simple_riotfile.py::Test_Django"]);
+        assert_eq!(targets, vec!["rt/__init__.py::Test_Django"]);
     }
 
     #[test]
     fn parse_pytest_targets_collects_multiple_files() {
-        let targets = parse_pytest_targets(
-            "pytest -vvv {cmdargs} tests/data/simple_riotfile.py tests/data/real_use_riotfile.py",
-        );
+        let targets = parse_pytest_targets("pytest -vvv {cmdargs} rt/__init__.py rt/__main__.py");
 
-        assert_eq!(
-            targets,
-            vec![
-                "tests/data/simple_riotfile.py",
-                "tests/data/real_use_riotfile.py",
-            ]
-        );
+        assert_eq!(targets, vec!["rt/__init__.py", "rt/__main__.py"]);
     }
 
     #[test]
     fn services_match_suitespec_pattern_with_riot_match_semantics() {
-        let root = ProviderVenvNode {
+        let root = RiotVenvNode {
             name: Some("integration-snapshot".to_owned()),
             pys: vec!["3.12".to_owned()],
-            ..ProviderVenvNode::default()
+            ..RiotVenvNode::default()
         };
-        let service_rules = ProviderSuites::from([
+        let service_rules = RiotSuites::from([
             ("snapshot".to_owned(), suite(&["redis"], &[])),
             (
                 "integration-snapshot*".to_owned(),
@@ -846,12 +837,12 @@ mod tests {
 
     #[test]
     fn suitespec_env_is_attached_and_service_hosts_are_localized() {
-        let root = ProviderVenvNode {
+        let root = RiotVenvNode {
             name: Some("flask".to_owned()),
             pys: vec!["3.12".to_owned()],
-            ..ProviderVenvNode::default()
+            ..RiotVenvNode::default()
         };
-        let service_rules = ProviderSuites::from([(
+        let service_rules = RiotSuites::from([(
             "flask".to_owned(),
             suite(
                 &["memcached", "redis"],

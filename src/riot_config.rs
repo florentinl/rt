@@ -1,41 +1,127 @@
-use std::{ffi::CString, fs, path::Path};
+use std::{collections::HashMap, ffi::CString, fs, path::Path};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyDict, PyIterator, PyModule, PyStringMethods};
 
-use crate::{
-    config_provider::{ConfigProvider, LoadedConfig, ProviderVenvNode, pyo3::get_suites},
-    error::{RtError, RtResult},
-};
+use crate::error::{RtError, RtResult};
+
+#[derive(Default)]
+pub struct RiotSuite {
+    pub services: Vec<String>,
+    pub env: IndexMap<String, String>,
+}
+
+pub type RiotSuites = HashMap<String, RiotSuite>;
+
+#[derive(Default)]
+pub struct RiotVenvNode {
+    pub name: Option<String>,
+    pub command: Option<String>,
+    pub pys: Vec<String>,
+    pub pkgs: IndexMap<String, Vec<String>>,
+    pub env: IndexMap<String, Vec<String>>,
+    pub create: Option<bool>,
+    pub skip_dev_install: Option<bool>,
+    pub venvs: Vec<Self>,
+}
+
+pub struct RiotConfig {
+    pub root: RiotVenvNode,
+    pub suites: Option<RiotSuites>,
+}
 
 /// Load the effective configuration produced by Riot itself.
 ///
-/// This provider deliberately stops at Riot's in-memory configuration API: it
+/// This loader deliberately stops at Riot's in-memory configuration API: it
 /// constructs `Venv` objects and iterates `Venv.instances()`, but never asks an
 /// interpreter for its path or version and never calls Riot's preparation or
 /// requirements APIs. Environment creation and dependency installation remain
 /// exclusively owned by rt.
-pub struct RiotConfigProvider;
+pub fn load(riotfile_path: &Path) -> RtResult<RiotConfig> {
+    let project_path = riotfile_path
+        .parent()
+        .ok_or_else(|| RtError::message("error: could not determine riotfile parent directory"))?;
 
-impl ConfigProvider for RiotConfigProvider {
-    fn load(riotfile_path: &Path) -> RtResult<LoadedConfig> {
-        let project_path = riotfile_path.parent().ok_or_else(|| {
-            RtError::message("error: could not determine riotfile parent directory")
-        })?;
+    Python::attach(|py| {
+        py.import("gc")?.call_method0("disable")?;
 
-        Python::attach(|py| {
-            py.import("gc")?.call_method0("disable")?;
+        let root = load_effective_instances(py, riotfile_path)?;
+        let suites = get_suites(py, project_path);
 
-            let root = load_effective_instances(py, riotfile_path)?;
-            let suites = get_suites(py, project_path);
-
-            Ok(LoadedConfig { root, suites })
-        })
-    }
+        Ok(RiotConfig { root, suites })
+    })
 }
 
-fn load_effective_instances(py: Python<'_>, path: &Path) -> RtResult<ProviderVenvNode> {
+fn get_suites(py: Python<'_>, project_path: &Path) -> Option<RiotSuites> {
+    let python_code = format!(
+        "import sys; sys.path.insert(0, r\"{}\"); from tests.suitespec import get_suites; SUITES = get_suites()",
+        project_path.to_string_lossy()
+    );
+    let code = CString::new(python_code).ok()?;
+    extract_suitespec_suites(py, &code).ok()
+}
+
+fn extract_suitespec_suites(py: Python<'_>, code: &CString) -> PyResult<RiotSuites> {
+    let module = PyModule::from_code(py, code.as_c_str(), c"get_services", c"_get_service")?;
+    let suites_object = module.getattr("SUITES")?;
+    let suites: &Bound<'_, PyDict> = suites_object.cast()?;
+    let mut result = RiotSuites::new();
+
+    for (key, value) in suites {
+        let suite_name: String = key.extract()?;
+        let dict: &Bound<'_, PyDict> = value.cast()?;
+        let services: Option<Vec<String>> = dict
+            .get_item("services")?
+            .and_then(|value| value.extract().ok());
+        let snapshot = dict
+            .get_item("snapshot")?
+            .and_then(|value| value.extract::<bool>().ok())
+            .unwrap_or(false);
+        let pattern = dict
+            .get_item("pattern")?
+            .map_or_else(|| Ok(suite_name), |value| value.extract())?;
+
+        let mut services = services
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<IndexSet<_>>();
+        if snapshot {
+            services.insert("testagent".to_owned());
+        }
+
+        let env = dict
+            .get_item("env")?
+            .as_ref()
+            .map(extract_suite_env)
+            .transpose()?
+            .unwrap_or_default();
+
+        if services.is_empty() && env.is_empty() {
+            continue;
+        }
+
+        let entry: &mut RiotSuite = result.entry(pattern).or_default();
+        entry.services.extend(services);
+        entry.env.extend(env);
+    }
+
+    Ok(result)
+}
+
+/// Stringify a suitespec `env` mapping like `scripts/run-tests` does.
+fn extract_suite_env(value: &Bound<'_, PyAny>) -> PyResult<IndexMap<String, String>> {
+    let dict: &Bound<'_, PyDict> = value.cast()?;
+    let mut env = IndexMap::with_capacity(dict.len());
+    for (key, value) in dict {
+        if !value.is_none() {
+            env.insert(key.extract()?, value.str()?.to_str()?.to_owned());
+        }
+    }
+    Ok(env)
+}
+
+fn load_effective_instances(py: Python<'_>, path: &Path) -> RtResult<RiotVenvNode> {
     // Fail before executing project code if the pinned Riot runtime is not
     // available. Importing Riot itself does not discover interpreters or touch
     // its environment root.
@@ -69,13 +155,13 @@ fn load_effective_instances(py: Python<'_>, path: &Path) -> RtResult<ProviderVen
         leaves.push(extract_instance(&instance?)?);
     }
 
-    Ok(ProviderVenvNode {
+    Ok(RiotVenvNode {
         venvs: leaves,
-        ..ProviderVenvNode::default()
+        ..RiotVenvNode::default()
     })
 }
 
-fn extract_instance(instance: &Bound<'_, PyAny>) -> PyResult<ProviderVenvNode> {
+fn extract_instance(instance: &Bound<'_, PyAny>) -> PyResult<RiotVenvNode> {
     let chain = instance_chain(instance)?;
     let pkgs = extract_full_packages(&chain)?;
     let env = extract_mapping(&instance.getattr("env")?)?;
@@ -89,7 +175,7 @@ fn extract_instance(instance: &Bound<'_, PyAny>) -> PyResult<ProviderVenvNode> {
 
     let (create, skip_dev_install) = effective_creation(&chain)?;
 
-    Ok(ProviderVenvNode {
+    Ok(RiotVenvNode {
         name: extract_optional_string(instance, "name")?,
         command: extract_optional_string(instance, "command")?,
         pys,
@@ -176,11 +262,8 @@ mod tests {
     use pyo3::{Python, types::PyAnyMethods};
     use tempfile::tempdir;
 
-    use super::RiotConfigProvider;
-    use crate::{
-        config_provider::{ConfigProvider, Pyo3ConfigProvider},
-        venv::load_context,
-    };
+    use super::load;
+    use crate::venv::load_context;
 
     static PYTHON_INIT: Once = Once::new();
 
@@ -265,7 +348,7 @@ venv.instances = configured_instances
         let riotfile = project.path().join("riotfile.py");
         fs::write(&riotfile, RIOTFILE).unwrap();
 
-        let loaded = RiotConfigProvider::load(&riotfile).unwrap();
+        let loaded = load(&riotfile).unwrap();
 
         assert_eq!(loaded.root.venvs.len(), 4);
         assert!(!project.path().join(".riot").exists());
@@ -283,7 +366,7 @@ venv.instances = configured_instances
         let riotfile = project.path().join("riotfile.py");
         fs::write(&riotfile, RIOTFILE).unwrap();
 
-        let venvs = load_context::<RiotConfigProvider>(&riotfile, None).unwrap();
+        let venvs = load_context(&riotfile, None).unwrap();
 
         assert_eq!(venvs.len(), 4);
         for (hash, venv) in venvs {
@@ -300,32 +383,5 @@ venv.instances = configured_instances
                 })
             );
         }
-    }
-
-    #[test]
-    fn legacy_constructor_provider_remains_available() {
-        initialize_python();
-        let project = tempdir().unwrap();
-        let riotfile = project.path().join("riotfile.py");
-        fs::write(
-            &riotfile,
-            r#"
-from riot import Venv
-
-venv = Venv(
-    name="legacy",
-    command="pytest tests/legacy",
-    pys=["3.12"],
-    pkgs={"pytest": "==8"},
-)
-"#,
-        )
-        .unwrap();
-
-        let loaded = Pyo3ConfigProvider::load(&riotfile).unwrap();
-
-        assert_eq!(loaded.root.name.as_deref(), Some("legacy"));
-        assert_eq!(loaded.root.pys, ["3.12"]);
-        assert_eq!(loaded.root.pkgs.get("pytest").unwrap(), &["==8"]);
     }
 }

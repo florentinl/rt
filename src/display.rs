@@ -40,14 +40,9 @@ pub fn strip_ansi(text: &str) -> String {
     result
 }
 
-/// Measure the visual width of a string (ignoring ANSI escape codes).
-fn visual_width(text: &str) -> usize {
-    strip_ansi(text).len()
-}
-
 /// Truncate a line to fit within the given width, preserving ANSI codes and adding ellipsis.
 fn truncate_line(line: &str, max_width: usize) -> String {
-    let visual_len = visual_width(line);
+    let visual_len = strip_ansi(line).len();
 
     if visual_len <= max_width {
         return line.to_string();
@@ -93,7 +88,6 @@ pub enum StepStatus {
     Pending,
     Running,
     Done,
-    Cached,
     Failed,
 }
 
@@ -104,7 +98,6 @@ fn status_icon(status: StepStatus) -> String {
         StepStatus::Pending => "[pending]".with(Color::DarkGrey).to_string(),
         StepStatus::Running => "[running]".with(Color::Cyan).to_string(),
         StepStatus::Done => "[done]".with(Color::Green).to_string(),
-        StepStatus::Cached => "[cached]".with(Color::Yellow).to_string(),
         StepStatus::Failed => "[failed]".with(Color::Red).to_string(),
     }
 }
@@ -126,15 +119,11 @@ fn dim(text: &str) -> String {
     result
 }
 
-/// Prefix output line with a vertical bar (for nested output display).
-#[must_use]
-fn output_prefix() -> String {
-    "  │ ".to_string()
-}
-
 const RUNNING_MIN_LINES: usize = 6;
 const FAILED_BLOCK_LINES: usize = 5;
 const COLLAPSED_LINE_COST: usize = 1;
+const MAX_OUTPUT_LINES: usize = 100;
+const OUTPUT_PREFIX: &str = "  │ ";
 
 #[derive(Clone, Copy)]
 enum FrameMode {
@@ -156,7 +145,7 @@ enum StepRenderStyle {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct RenderState {
     dirty: bool,
     shutdown: bool,
@@ -168,82 +157,58 @@ struct RenderSignal {
     cv: Condvar,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct RenderSnapshot {
     terminal_size: Option<(usize, usize)>,
     elapsed_seconds: u64,
 }
 
 /// A single build step with its output buffer.
-#[derive(Debug, Clone)]
-pub struct BuildStep {
-    pub description: String,
-    pub status: StepStatus,
-    pub output_lines: VecDeque<String>,
-    pub start_time: Option<Instant>,
-    pub end_time: Option<Instant>,
-    pub max_output_lines: usize,
+struct BuildStep {
+    description: String,
+    status: StepStatus,
+    output_lines: VecDeque<String>,
 }
 
 impl BuildStep {
     /// Create a new build step in Pending state.
     #[must_use]
-    pub const fn new(description: String) -> Self {
+    const fn new(description: String) -> Self {
         Self {
             description,
             status: StepStatus::Pending,
             output_lines: VecDeque::new(),
-            start_time: None,
-            end_time: None,
-            max_output_lines: 100, // Keep last 100 lines in buffer
         }
     }
 
     /// Append a line of output to this step's buffer.
-    pub fn append_output(&mut self, line: String) {
-        if self.output_lines.len() >= self.max_output_lines {
+    fn append_output(&mut self, line: String) {
+        if self.output_lines.len() >= MAX_OUTPUT_LINES {
             self.output_lines.pop_front();
         }
         self.output_lines.push_back(line);
     }
 
     /// Append multiple output lines to this step's buffer.
-    pub fn append_outputs(&mut self, lines: Vec<String>) {
+    fn append_outputs(&mut self, lines: Vec<String>) {
         for line in lines {
             self.append_output(line);
         }
     }
 
-    /// Update the status and record timestamps.
-    pub fn update_status(&mut self, status: StepStatus) {
+    const fn update_status(&mut self, status: StepStatus) {
         self.status = status;
-        match status {
-            StepStatus::Running => {
-                if self.start_time.is_none() {
-                    self.start_time = Some(Instant::now());
-                }
-            }
-            StepStatus::Done | StepStatus::Cached | StepStatus::Failed => {
-                if self.end_time.is_none() {
-                    self.end_time = Some(Instant::now());
-                }
-            }
-            StepStatus::Pending => {}
-        }
     }
 
     /// Check if this step should show as fully collapsed (no expansion).
     #[must_use]
-    pub const fn is_fully_collapsed(&self) -> bool {
-        matches!(
-            self.status,
-            StepStatus::Pending | StepStatus::Done | StepStatus::Cached
-        )
+    const fn is_fully_collapsed(&self) -> bool {
+        matches!(self.status, StepStatus::Pending | StepStatus::Done)
     }
 
     /// Render this step as a collapsed single line.
     #[must_use]
-    pub fn render_collapsed(&self) -> String {
+    fn render_collapsed(&self) -> String {
         let icon = status_icon(self.status);
         format!("{} {}", icon, self.description)
     }
@@ -255,7 +220,7 @@ impl BuildStep {
     /// - `terminal_width`: If Some, truncate lines to fit; if None, no truncation (allows wrapping)
     /// - `apply_dim`: Whether to apply dimming to the output
     #[must_use]
-    pub fn render_expanded(
+    fn render_expanded(
         &self,
         max_output_lines: usize,
         terminal_width: Option<usize>,
@@ -287,9 +252,9 @@ impl BuildStep {
             );
 
             let formatted = if apply_dim {
-                format!("{}{}", output_prefix(), dim(&processed_line))
+                format!("{OUTPUT_PREFIX}{}", dim(&processed_line))
             } else {
-                format!("{}{}", output_prefix(), processed_line)
+                format!("{OUTPUT_PREFIX}{processed_line}")
             };
             lines.push(formatted);
         }
@@ -314,7 +279,6 @@ impl DisplayManager {
         (StepStatus::Failed, FAILED_BLOCK_LINES),
         (StepStatus::Pending, COLLAPSED_LINE_COST),
         (StepStatus::Done, COLLAPSED_LINE_COST),
-        (StepStatus::Cached, COLLAPSED_LINE_COST),
     ];
 
     /// Create a new `DisplayManager`.
@@ -323,7 +287,7 @@ impl DisplayManager {
     ///
     /// Returns an error if the terminal cannot be initialized.
     #[must_use = "The manager must stay alive to render progress updates"]
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         let mut stderr = stderr();
         stderr.execute(cursor::Hide)?;
         let display = Self {
@@ -345,7 +309,7 @@ impl DisplayManager {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn register_step(&self, id: &str, description: &str) {
+    pub(crate) fn register_step(&self, id: &str, description: &str) {
         let mut steps = self.steps.lock().unwrap();
         // Idempotent: don't reset a step that was already registered.
         if !steps.contains_key(id) {
@@ -360,7 +324,7 @@ impl DisplayManager {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn update_step_status(&self, id: &str, status: StepStatus) {
+    pub(crate) fn update_step_status(&self, id: &str, status: StepStatus) {
         let mut steps = self.steps.lock().unwrap();
         if let Some(step) = steps.get_mut(id) {
             step.update_status(status);
@@ -374,7 +338,7 @@ impl DisplayManager {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn append_output(&self, id: &str, line: String) {
+    pub(crate) fn append_output(&self, id: &str, line: String) {
         let mut steps = self.steps.lock().unwrap();
         if let Some(step) = steps.get_mut(id) {
             step.append_output(line);
@@ -388,7 +352,7 @@ impl DisplayManager {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
-    pub fn append_outputs(&self, id: &str, lines: Vec<String>) {
+    pub(crate) fn append_outputs(&self, id: &str, lines: Vec<String>) {
         if lines.is_empty() {
             return;
         }
@@ -408,7 +372,7 @@ impl DisplayManager {
     /// # Panics
     ///
     /// Panics if locking the stderr or steps mutexes fails.
-    pub fn start_refresh_loop(&self) {
+    fn start_refresh_loop(&self) {
         let steps = Arc::clone(&self.steps);
         let stderr = Arc::clone(&self.stderr);
         let render_signal = Arc::clone(&self.render_signal);
@@ -550,7 +514,7 @@ impl DisplayManager {
         steps.values().all(|s| {
             matches!(
                 s.status,
-                StepStatus::Done | StepStatus::Cached | StepStatus::Failed | StepStatus::Pending
+                StepStatus::Done | StepStatus::Failed | StepStatus::Pending
             )
         })
     }
@@ -722,25 +686,23 @@ impl DisplayManager {
         terminal_width: usize,
         start_time: Instant,
     ) -> String {
-        let mut counts = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut counts = (0usize, 0usize, 0usize, 0usize);
         for step in steps.values() {
             match step.status {
                 StepStatus::Pending => counts.0 += 1,
                 StepStatus::Running => counts.1 += 1,
                 StepStatus::Done => counts.2 += 1,
-                StepStatus::Cached => counts.3 += 1,
-                StepStatus::Failed => counts.4 += 1,
+                StepStatus::Failed => counts.3 += 1,
             }
         }
 
-        let (pending, running, done, cached, failed) = counts;
+        let (pending, running, done, failed) = counts;
         let total_steps = steps.len();
-        let completed = done + cached + failed;
+        let completed = done + failed;
         let parts = [
             (StepStatus::Running, running),
             (StepStatus::Pending, pending),
             (StepStatus::Done, done),
-            (StepStatus::Cached, cached),
             (StepStatus::Failed, failed),
         ];
 
@@ -765,19 +727,15 @@ impl DisplayManager {
 
         truncate_line(&line, terminal_width)
     }
-
-    fn elapsed_seconds(start_time: Instant) -> u64 {
-        Instant::now()
-            .saturating_duration_since(start_time)
-            .as_secs()
-    }
 }
 
 impl RenderSnapshot {
     fn capture(start_time: Instant) -> Self {
         Self {
             terminal_size: DisplayManager::terminal_dimensions().ok(),
-            elapsed_seconds: DisplayManager::elapsed_seconds(start_time),
+            elapsed_seconds: Instant::now()
+                .saturating_duration_since(start_time)
+                .as_secs(),
         }
     }
 }

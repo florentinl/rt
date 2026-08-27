@@ -28,13 +28,11 @@ export class WorkspaceResolver {
    * Priority: URI in scope → active editor → single workspace → undefined
    */
   getWorkspaceFolder(
-    scope?: SetEnvironmentScope | GetEnvironmentScope | vscode.Uri,
+    scope?: GetEnvironmentScope | vscode.Uri,
     environment?: PythonEnvironment,
   ): vscode.Uri | undefined {
-    // Try to extract URI from scope
-    const uri = this.extractUri(scope);
-    if (uri) {
-      const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (isUri(scope)) {
+      const folder = vscode.workspace.getWorkspaceFolder(scope);
       if (folder) {
         return folder.uri;
       }
@@ -98,29 +96,13 @@ export class WorkspaceResolver {
       const folders = scope
         .map((uri) => vscode.workspace.getWorkspaceFolder(uri)?.uri)
         .filter((uri): uri is vscode.Uri => uri !== undefined);
-      return this.uniqueUris(folders);
+      return Array.from(
+        new Map(folders.map((uri) => [uri.toString(), uri])).values(),
+      );
     }
 
     const folder = this.getWorkspaceFolder(scope, environment);
     return folder ? [folder] : [];
   }
 
-  /**
-   * Extract URI from various scope types
-   */
-  private extractUri(
-    scope?: SetEnvironmentScope | GetEnvironmentScope | vscode.Uri,
-  ): vscode.Uri | undefined {
-    if (isUri(scope)) {
-      return scope;
-    }
-    if (Array.isArray(scope) && scope.length > 0 && isUri(scope[0])) {
-      return scope[0];
-    }
-    return undefined;
-  }
-
-  private uniqueUris(uris: vscode.Uri[]): vscode.Uri[] {
-    return Array.from(new Map(uris.map((uri) => [uri.toString(), uri])).values());
-  }
 }

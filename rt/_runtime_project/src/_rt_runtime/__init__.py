@@ -11,18 +11,6 @@ from typing import Any
 _context: dict[str, Any] | None = None
 
 
-def _configure_project_path(context: dict[str, Any]) -> None:
-    if not context["no_editable"]:
-        return
-
-    project_root = context["project_root"]
-    # The installed package must take precedence over the local source tree.
-    # Keep the project importable for test helpers, but move it behind the
-    # installed package.
-    sys.path[:] = [path for path in sys.path if path not in ("", project_root)]
-    sys.path.append(project_root)
-
-
 def startup() -> None:
     """Apply the execution context recorded by rt for this virtual environment."""
     global _context
@@ -39,7 +27,12 @@ def startup() -> None:
 
     project_root = context["project_root"]
 
-    _configure_project_path(context)
+    if context["no_editable"]:
+        # The installed package must take precedence over the local source tree.
+        # Keep the project importable for test helpers, but move it behind the
+        # installed package.
+        sys.path[:] = [path for path in sys.path if path not in ("", project_root)]
+        sys.path.append(project_root)
 
     for key, value in context["environment"].items():
         os.environ[key] = value

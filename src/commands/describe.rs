@@ -62,10 +62,10 @@ fn describe_venv(repo: &RepoConfig, venv: &RiotVenv) {
             6,
         );
         if ctx.create {
-            print_kv("create venv", bool_flag(true), 6);
+            print_kv("create venv", "yes".with(Color::Green), 6);
         }
         if ctx.skip_dev_install {
-            print_kv("skip dev install", bool_flag(true), 6);
+            print_kv("skip dev install", "yes".with(Color::Green), 6);
         }
         print_kv("command", format_command(ctx.command.as_deref()), 6);
         print_section("env", 6, || print_env_block(&ctx.env, 8));
@@ -125,14 +125,6 @@ fn style_label(label: &str) -> String {
         .with(Color::White)
         .attribute(Attribute::Bold)
         .to_string()
-}
-
-fn bool_flag(value: bool) -> String {
-    if value {
-        "yes".with(Color::Green).to_string()
-    } else {
-        "no".with(Color::Red).attribute(Attribute::Dim).to_string()
-    }
 }
 
 fn format_command(cmd: Option<&str>) -> String {

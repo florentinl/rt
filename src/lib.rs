@@ -11,19 +11,19 @@ mod command;
 mod commands;
 mod completion;
 mod config;
-mod config_provider;
 mod constants;
 mod display;
 mod error;
 mod progress;
+mod riot_config;
 mod ui;
 mod uv_project;
 mod venv;
 
 use crate::{
-    config::{RepoConfig, RunConfig, Selector},
+    config::{RepoConfig, Selector},
     error::{RtError, RtResult},
-    venv::{RiotVenv, load_context},
+    venv::RiotVenv,
 };
 use clap::{Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
@@ -33,7 +33,6 @@ use std::{
     sync::OnceLock,
 };
 
-type DefaultConfigProvider = crate::config_provider::RiotConfigProvider;
 static RUNTIME_PROJECT: OnceLock<PathBuf> = OnceLock::new();
 
 #[pymodule]
@@ -45,7 +44,6 @@ fn _rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     RUNTIME_PROJECT.get_or_init(|| module_dir.join("_runtime_project"));
 
     m.add_function(wrap_pyfunction!(cli_main, m)?)?;
-    m.add_class::<config_provider::PyVenv>()?;
     Ok(())
 }
 
@@ -235,12 +233,6 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum VscodeCommands {
-    /// Remove VS Code configuration set by rt.
-    Clear,
-}
-
 /// Dispatch the selected CLI command.
 ///
 /// # Errors
@@ -299,26 +291,22 @@ fn run_command(
             pattern,
             test,
             cmdargs,
-        } => {
-            let run_config = RunConfig {
-                command_override,
-                cmdargs,
-                action_label: "Execute".to_string(),
-            };
-            commands::run::run(
-                riot_venvs,
-                repo,
-                Selector::Generic {
-                    python,
-                    pattern: Some(pattern),
-                    test,
-                },
+        } => commands::run::run(
+            riot_venvs,
+            repo,
+            Selector::Generic {
+                python,
+                pattern: Some(pattern),
+                test,
+            },
+            &commands::run::Options {
                 force_reinstall,
                 no_editable,
                 parallel,
-                &run_config,
-            )
-        }
+                command_override,
+                cmdargs,
+            },
+        ),
         Commands::Shell {
             hash,
             force_reinstall,
@@ -390,18 +378,6 @@ fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> Rt
     path.ok_or_else(|| RtError::message("error: could not create riot root directory"))
 }
 
-/// Load and normalize venvs from the riotfile, optionally enriching with lockfile data.
-///
-/// # Errors
-///
-/// Returns an error if the riotfile cannot be loaded or parsed.
-pub fn load_context_with_default_provider(
-    riotfile_path: &Path,
-    riot_root: Option<&Path>,
-) -> RtResult<IndexMap<String, RiotVenv>> {
-    load_context::<DefaultConfigProvider>(riotfile_path, riot_root)
-}
-
 fn runtime_project_path() -> RtResult<PathBuf> {
     RUNTIME_PROJECT
         .get()
@@ -426,9 +402,12 @@ fn try_main(args: Vec<String>) -> RtResult<()> {
         _ => {}
     }
 
-    let riot_venvs = load_context_with_default_provider(&riotfile_path, Some(&riot_root))?;
+    let riot_venvs = venv::load_context(&riotfile_path, Some(&riot_root))?;
 
-    let repo_config = RepoConfig::new(riotfile_path, riot_root);
+    let repo_config = RepoConfig {
+        riotfile_path,
+        riot_root,
+    };
 
     run_command(riot_venvs, cli, &repo_config)
 }

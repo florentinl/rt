@@ -5,7 +5,7 @@ use std::{
 
 pub type RtResult<T> = Result<T, RtError>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RtError {
     exit_code: u8,
     message: Option<String>,
@@ -13,7 +13,7 @@ pub struct RtError {
 
 impl RtError {
     #[must_use]
-    pub fn message(message: impl Into<String>) -> Self {
+    pub(crate) fn message(message: impl Into<String>) -> Self {
         Self {
             exit_code: 1,
             message: Some(message.into()),
@@ -21,7 +21,7 @@ impl RtError {
     }
 
     #[must_use]
-    pub fn with_code(exit_code: u8, message: impl Into<String>) -> Self {
+    pub(crate) fn with_code(exit_code: u8, message: impl Into<String>) -> Self {
         Self {
             exit_code,
             message: Some(message.into()),
@@ -29,7 +29,7 @@ impl RtError {
     }
 
     #[must_use]
-    pub const fn silent(exit_code: u8) -> Self {
+    pub(crate) const fn silent(exit_code: u8) -> Self {
         Self {
             exit_code,
             message: None,
@@ -37,16 +37,16 @@ impl RtError {
     }
 
     #[must_use]
-    pub fn silent_from_status(status: ExitStatus) -> Self {
+    pub(crate) fn silent_from_status(status: ExitStatus) -> Self {
         Self::silent(status_exit_code(status))
     }
 
     #[must_use]
-    pub const fn exit_code(&self) -> u8 {
+    pub(crate) const fn exit_code(&self) -> u8 {
         self.exit_code
     }
 
-    pub fn report(&self) {
+    pub(crate) fn report(&self) {
         if let Some(message) = &self.message {
             eprintln!("{message}");
         }

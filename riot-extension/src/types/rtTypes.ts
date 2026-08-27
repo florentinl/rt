@@ -29,8 +29,5 @@ export type RtVenv = {
     execution_contexts: RtExecutionContext[];
 };
 
-export const normalizeManagerName = (name: string): string =>
-    name.toLowerCase().replace(/[^a-zA-Z0-9-_]/g, '_');
-
 export const buildManagerId = (extensionId: string, name: string): string =>
-    `${extensionId}:${normalizeManagerName(name)}`;
+    `${extensionId}:${name.toLowerCase().replace(/[^a-zA-Z0-9-_]/g, '_')}`;

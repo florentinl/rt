@@ -40,20 +40,6 @@ struct JsonVenv {
     execution_contexts: Vec<JsonExecutionContext>,
 }
 
-fn python_path(venv_path: &str) -> String {
-    Path::new(venv_path)
-        .join("bin/python")
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn activate_path(venv_path: &str) -> String {
-    Path::new(venv_path)
-        .join("bin/activate")
-        .to_string_lossy()
-        .into_owned()
-}
-
 fn format_entries(map: &IndexMap<String, String>, max_entries: usize) -> Option<String> {
     if map.is_empty() {
         return None;
@@ -201,8 +187,14 @@ pub fn run(
                         let (display_name, short_display_name) = build_display_names(&venv, ctx);
                         JsonExecutionContext {
                             hash: ctx.hash.clone(),
-                            python_path: python_path(&ctx_venv_path),
-                            activate_path: activate_path(&ctx_venv_path),
+                            python_path: Path::new(&ctx_venv_path)
+                                .join("bin/python")
+                                .to_string_lossy()
+                                .into_owned(),
+                            activate_path: Path::new(&ctx_venv_path)
+                                .join("bin/activate")
+                                .to_string_lossy()
+                                .into_owned(),
                             display_name,
                             short_display_name,
                             venv_path: ctx_venv_path,

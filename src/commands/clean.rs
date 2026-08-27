@@ -48,9 +48,6 @@ pub fn run(riot_root: &Path) -> RtResult<()> {
 
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == "requirements" {
-            continue;
-        }
         if !name.starts_with(VENV_PREFIX) {
             continue;
         }

@@ -11,8 +11,8 @@ use crate::{
     config::Selector,
     error::{RtError, RtResult},
     progress::{
-        MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
-        StepOutcome, Task, TaskRunner, summarize_errors,
+        MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId, Task,
+        TaskRunner, summarize_errors,
     },
     uv_project::{ensure_uv_project, has_pkg},
     venv::{ExecutionContext, RiotVenv, venv_path},
@@ -151,7 +151,7 @@ impl BuildSharedState {
         venv: &RiotVenv,
         exc: &ExecutionContext,
         ctx: &StepContext,
-    ) -> RtResult<StepOutcome> {
+    ) -> RtResult<()> {
         let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
         if self.force_reinstall && exc_venv_path.exists() {
             fs::remove_dir_all(&exc_venv_path)?;
@@ -211,7 +211,7 @@ impl BuildSharedState {
 
         self.write_runtime_context(venv, exc, &exc_venv_path)?;
 
-        Ok(StepOutcome::Done)
+        Ok(())
     }
 
     fn write_runtime_context(
@@ -278,7 +278,16 @@ fn libmemcached_prefix() -> Option<String> {
                 return Some(prefix.to_string_lossy().into_owned());
             }
 
-            brew_prefix("libmemcached")
+            Command::new("brew")
+                .args(["--prefix", "libmemcached"])
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|prefix| prefix.trim().to_owned())
+                .filter(|prefix| !prefix.is_empty())
+                .map(PathBuf::from)
                 .into_iter()
                 .chain(
                     [
@@ -294,21 +303,6 @@ fn libmemcached_prefix() -> Option<String> {
                 .map(|prefix| prefix.to_string_lossy().into_owned())
         })
         .clone()
-}
-
-fn brew_prefix(formula: &str) -> Option<PathBuf> {
-    let output = Command::new("brew")
-        .args(["--prefix", formula])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let prefix = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!prefix.is_empty()).then(|| PathBuf::from(prefix))
 }
 
 #[cfg(test)]

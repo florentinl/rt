@@ -49,14 +49,9 @@ fn format_unique_entries(
 }
 
 pub fn print_venv_hierarchy(venvs: &[RiotVenv], mut emit: impl FnMut(&str)) {
-    let venvs: Vec<&RiotVenv> = venvs.iter().collect();
-    if venvs.is_empty() {
-        return;
-    }
-
     for selected in venvs {
         let deps_raw = format_pkgs(&selected.pkgs, &selected.shared_pkgs);
-        let deps = deps_raw.trim().to_string();
+        let deps = deps_raw.trim();
 
         let mut contexts = selected.execution_contexts.iter().collect::<Vec<_>>();
         contexts.sort_by_key(|exc| &exc.hash);

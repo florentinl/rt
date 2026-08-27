@@ -16,7 +16,7 @@ use crate::{
 
 // Keep derived projects under the existing `.riot/venv*` cache namespace so
 // repository ignore rules and `rt clean` handle them without project changes.
-pub const UV_PROJECTS_DIR: &str = "venv_uv_projects";
+const UV_PROJECTS_DIR: &str = "venv_uv_projects";
 
 /// Generate the disposable uv project used to materialize one execution context.
 ///

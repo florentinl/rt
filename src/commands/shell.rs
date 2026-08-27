@@ -10,7 +10,7 @@ use crate::{
     commands::build::build_selected_contexts,
     config::{RepoConfig, Selector},
     error::{RtError, RtResult},
-    ui::{self},
+    ui,
     venv::{ExecutionContext, RiotVenv, select_execution_contexts, venv_python_path},
 };
 
@@ -44,43 +44,32 @@ pub fn run(
 pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> RtResult<RiotVenv> {
     let mut venvs = select_execution_contexts(venvs, Selector::Pattern(hash.to_string()))?;
     if venvs.len() != 1 {
-        return Err(RtError::message(
-            "Found multiple corresponding virtual environments, aborting...",
-        ));
+        return Err(RtError::message(format!(
+            "Expected one corresponding virtual environment, found {}",
+            venvs.len()
+        )));
     }
-    let Some(mut venv) = venvs.pop() else {
-        return Err(RtError::message(
-            "Found multiple corresponding virtual environments, aborting...",
-        ));
-    };
+    let mut venv = venvs.pop().expect("the selected venv count is one");
 
     venv.execution_contexts.retain(|exc| exc.hash == hash);
 
-    let n_ctx = venv.execution_contexts.len();
-    if n_ctx >= 2 {
-        return Err(RtError::message(
-            "Found multiple corresponding virtual environments, aborting...",
-        ));
+    match venv.execution_contexts.len() {
+        0 => venv.execution_contexts.push(ExecutionContext {
+            command: None,
+            pytest_targets: Vec::new(),
+            env: IndexMap::new(),
+            create: false,
+            skip_dev_install: false,
+            hash: venv.hash.clone(),
+        }),
+        1 => {}
+        count => {
+            return Err(RtError::message(format!(
+                "Expected one corresponding execution context, found {count}"
+            )));
+        }
     }
-
-    if n_ctx == 1 {
-        return Ok(venv);
-    }
-
-    venv.execution_contexts.push(make_venv_shell_context(&venv));
     Ok(venv)
-}
-
-#[must_use]
-pub fn make_venv_shell_context(venv: &RiotVenv) -> ExecutionContext {
-    ExecutionContext {
-        command: None,
-        pytest_targets: vec![],
-        env: IndexMap::new(),
-        create: false,
-        skip_dev_install: false,
-        hash: venv.hash.clone(),
-    }
 }
 
 fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {

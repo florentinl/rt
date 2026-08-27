@@ -8,10 +8,6 @@ use std::{
 
 use crate::progress::{OutputPolicy, ProgressLogger, StepId};
 
-fn uv_bin() -> std::ffi::OsString {
-    std::env::var_os("_RT_UV_BIN").unwrap_or_else(|| std::ffi::OsString::from("uv"))
-}
-
 /// A wrapper around `std::process::Command` that captures output and streams it to a
 /// progress sink.
 pub struct ManagedCommand {
@@ -21,14 +17,17 @@ pub struct ManagedCommand {
 }
 
 impl ManagedCommand {
-    /// Create a new `ManagedCommand`.
     #[must_use]
-    pub fn new<S: AsRef<OsStr>>(
-        program: S,
-        step_id: StepId,
-        sink: Arc<dyn ProgressLogger>,
-    ) -> Self {
-        let mut command = Command::new(program);
+    pub(crate) fn new_uv(subcommand: &str, sink: Arc<dyn ProgressLogger>, step_id: StepId) -> Self {
+        let mut command = Command::new(
+            std::env::var_os("_RT_UV_BIN").unwrap_or_else(|| std::ffi::OsString::from("uv")),
+        );
+        command
+            .arg(subcommand)
+            .arg("--no-config")
+            .arg("--color=always")
+            .env("UV_PYTHON_PREFERENCE", "only-managed")
+            .env("FORCE_COLOR", "1");
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
@@ -39,19 +38,9 @@ impl ManagedCommand {
         }
     }
 
-    #[must_use]
-    pub fn new_uv(subcommand: &str, sink: Arc<dyn ProgressLogger>, step_id: StepId) -> Self {
-        Self::new(uv_bin(), step_id, sink)
-            .arg(subcommand)
-            .arg("--no-config")
-            .arg("--color=always")
-            .env("UV_PYTHON_PREFERENCE", "only-managed")
-            .env("FORCE_COLOR", "1")
-    }
-
     /// Add arguments to the command.
     #[must_use]
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -62,14 +51,14 @@ impl ManagedCommand {
 
     /// Add a single argument to the command.
     #[must_use]
-    pub fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
+    pub(crate) fn arg<S: AsRef<OsStr>>(mut self, arg: S) -> Self {
         self.command.arg(arg);
         self
     }
 
     /// Set an environment variable for the command.
     #[must_use]
-    pub fn env<K, V>(mut self, key: K, val: V) -> Self
+    pub(crate) fn env<K, V>(mut self, key: K, val: V) -> Self
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -80,7 +69,7 @@ impl ManagedCommand {
 
     /// Set multiple environment variables for the command.
     #[must_use]
-    pub fn envs<I, K, V>(mut self, vars: I) -> Self
+    pub(crate) fn envs<I, K, V>(mut self, vars: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<OsStr>,
@@ -95,7 +84,7 @@ impl ManagedCommand {
     /// # Errors
     ///
     /// Returns an error if the child process cannot be spawned or waited on.
-    pub fn status(mut self) -> io::Result<ExitStatus> {
+    pub(crate) fn status(mut self) -> io::Result<ExitStatus> {
         if self.sink.output_policy() == OutputPolicy::Inherit {
             self.command.stdout(Stdio::inherit());
             self.command.stderr(Stdio::inherit());
@@ -116,8 +105,8 @@ impl ManagedCommand {
             .ok_or_else(|| io::Error::other("Failed to capture stderr"))?;
 
         // Spawn reader threads
-        let stdout_handle = self.spawn_reader_thread(stdout, "stdout");
-        let stderr_handle = self.spawn_reader_thread(stderr, "stderr");
+        let stdout_handle = self.spawn_reader_thread(stdout);
+        let stderr_handle = self.spawn_reader_thread(stderr);
 
         // Wait for the child process to complete
         let status = child.wait()?;
@@ -133,7 +122,6 @@ impl ManagedCommand {
     fn spawn_reader_thread<R: io::Read + Send + 'static>(
         &self,
         reader: R,
-        _stream_name: &str,
     ) -> thread::JoinHandle<()> {
         let step_id = self.step_id.clone();
         let sink = Arc::clone(&self.sink);

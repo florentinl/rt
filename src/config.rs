@@ -13,19 +13,3 @@ pub enum Selector {
         test: Option<String>,
     },
 }
-
-pub struct RunConfig {
-    pub command_override: Option<String>,
-    pub cmdargs: Vec<String>,
-    pub action_label: String,
-}
-
-impl RepoConfig {
-    #[must_use]
-    pub const fn new(riotfile_path: PathBuf, riot_root: PathBuf) -> Self {
-        Self {
-            riotfile_path,
-            riot_root,
-        }
-    }
-}

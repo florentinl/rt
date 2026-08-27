@@ -1,6 +1,6 @@
 import { RtVenv } from "../types/rtTypes";
 
-export interface RiotPackageMetadata {
+interface RiotPackageMetadata {
   readonly name: string;
   readonly version?: string;
   readonly tooltip: string;
@@ -18,7 +18,7 @@ export function buildPackageMetadata(venv: RtVenv): RiotPackageMetadata[] {
   const resolved = normalizedEntries(venv.resolved_pkgs);
   const names = new Map<string, string>();
 
-  for (const name of Object.keys(venv.display_pkgs ?? {})) {
+  for (const name of Object.keys(venv.display_pkgs)) {
     names.set(normalizePackageName(name), name);
   }
   for (const name of Object.keys(venv.pkgs)) {
@@ -33,11 +33,11 @@ export function buildPackageMetadata(venv: RtVenv): RiotPackageMetadata[] {
 
   return Array.from(names, ([normalized, name]) => {
     const declared = direct.get(normalized);
-    const version = resolved.get(normalized)?.value || undefined;
+    const version = resolved.get(normalized) || undefined;
     const isTransitive = declared === undefined;
     const tooltip = isTransitive
       ? `Installed transitive dependency${version ? `: ${version}` : ""}`
-      : buildDirectTooltip(name, declared.value, version);
+      : buildDirectTooltip(name, declared, version);
 
     return { name, version, tooltip, isTransitive };
   });
@@ -49,11 +49,11 @@ export function getDirectPackageNames(venv: RtVenv): Set<string> {
 
 function normalizedEntries(
   entries: Record<string, string>,
-): Map<string, { name: string; value: string }> {
+): Map<string, string> {
   return new Map(
     Object.entries(entries).map(([name, value]) => [
       normalizePackageName(name),
-      { name, value },
+      value,
     ]),
   );
 }

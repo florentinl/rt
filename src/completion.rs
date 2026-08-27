@@ -6,14 +6,14 @@ use indexmap::IndexMap;
 
 use crate::{
     config::Selector,
-    load_context_with_default_provider, locate_riotfile,
+    locate_riotfile,
     ui::{format_envs, format_pkgs},
-    venv::{RiotVenv, compare_python_versions, select_execution_contexts},
+    venv::{RiotVenv, compare_python_versions, load_context, select_execution_contexts},
 };
 
 fn get_venvs() -> IndexMap<String, RiotVenv> {
     locate_riotfile(None)
-        .and_then(|path| load_context_with_default_provider(&path, None))
+        .and_then(|path| load_context(&path, None))
         .unwrap_or_default()
 }
 

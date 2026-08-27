@@ -59,6 +59,3 @@ export async function activate(context: vscode.ExtensionContext) {
     "Riot Environment Manager registered with Python Environments API.",
   );
 }
-
-// This method is called when your extension is deactivated
-export function deactivate() {}
