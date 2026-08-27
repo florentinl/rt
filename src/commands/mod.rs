@@ -2,6 +2,7 @@ pub mod activate;
 pub mod build;
 pub mod clean;
 pub mod describe;
+pub mod is_venv_ready;
 pub mod list;
 pub mod run;
 pub mod shell;

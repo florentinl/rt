@@ -114,6 +114,20 @@ export class RtCliService {
     }
     await this.execute(args, { cwd, signal: options?.signal });
   }
+
+  /** Check whether rt considers an execution-context environment complete. */
+  async isVenvReady(hash: string, cwd: string): Promise<boolean> {
+    const stdout = (
+      await this.execute(["_is_venv_ready", hash], { cwd })
+    ).trim();
+    if (stdout === "true") {
+      return true;
+    }
+    if (stdout === "false") {
+      return false;
+    }
+    throw new Error(`Unexpected rt readiness response: ${JSON.stringify(stdout)}`);
+  }
 }
 
 function resolveRtCommand(

@@ -48,6 +48,7 @@ pub fn summarize_errors<E: Display>(errors: &[(String, E)], phase: &str) -> bool
 #[derive(Clone, Copy, Debug)]
 pub enum StepOutcome {
     Done,
+    #[allow(dead_code)]
     Cached,
 }
 
@@ -279,9 +280,7 @@ impl ProgressLogger for PlainProgressLogger {
     fn finish(&self, id: &StepId, status: StepStatus) {
         let steps = self.steps.lock().unwrap();
         if let Some(state) = steps.get(id) {
-            let elapsed = state
-                .started_at
-                .map(|t| format_duration(t.elapsed()));
+            let elapsed = state.started_at.map(|t| format_duration(t.elapsed()));
             let status_str = match status {
                 StepStatus::Done => "done",
                 StepStatus::Cached => "cached",

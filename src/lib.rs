@@ -17,6 +17,7 @@ mod display;
 mod error;
 mod progress;
 mod ui;
+mod uv_project;
 mod venv;
 
 use crate::{
@@ -217,6 +218,11 @@ enum Commands {
     },
     /// Remove all cached virtual environments while keeping compiled requirements.
     Clean,
+    #[command(name = "_is_venv_ready", hide = true)]
+    IsVenvReady {
+        #[arg(value_name = "HASH")]
+        hash: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +322,7 @@ fn run_command(
             force_reinstall,
         } => commands::switch::run(riot_venvs, repo, &hash, force_reinstall),
         Commands::Clean => commands::clean::run(&repo.riot_root),
+        Commands::IsVenvReady { hash } => commands::is_venv_ready::run(&repo.riot_root, &hash),
     }
 }
 
@@ -391,10 +398,15 @@ fn try_main(args: Vec<String>) -> RtResult<()> {
     let riotfile_path = locate_riotfile(cli.file.as_ref())?;
     let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
 
-    // Cleaning only needs the cache root. In particular, it must remain usable
-    // when the project's Python configuration is temporarily broken.
-    if matches!(&cli.command, Commands::Clean) {
-        return commands::clean::run(&riot_root);
+    // Cache maintenance and readiness checks only need the cache root. In
+    // particular, they must remain usable when the project's Python
+    // configuration is temporarily broken.
+    match &cli.command {
+        Commands::Clean => return commands::clean::run(&riot_root),
+        Commands::IsVenvReady { hash } => {
+            return commands::is_venv_ready::run(&riot_root, hash);
+        }
+        _ => {}
     }
 
     let riot_venvs = load_context_with_default_provider(&riotfile_path, Some(&riot_root))?;

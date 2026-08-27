@@ -426,7 +426,7 @@ export class RiotEnvManager implements EnvironmentManager {
       throw new Error(`Riot environment not found: ${requested.displayName}`);
     }
 
-    if (!this.environmentExecutableExists(record.environment)) {
+    if (!(await this.environmentIsReady(record))) {
       const controller = new AbortController();
       this.ongoingActivations.set(cwd, controller);
       try {
@@ -452,9 +452,9 @@ export class RiotEnvManager implements EnvironmentManager {
 
       const refreshed = await this.loadWorkspace(cwd, true);
       record = this.findRecord(refreshed, requested);
-      if (!record || !this.environmentExecutableExists(record.environment)) {
+      if (!record || !(await this.environmentIsReady(record))) {
         throw new Error(
-          `Environment interpreter not found after build: ${requested.displayName}`,
+          `Environment not ready after build: ${requested.displayName}`,
         );
       }
     }
@@ -575,6 +575,13 @@ export class RiotEnvManager implements EnvironmentManager {
 
   private environmentExecutableExists(environment: PythonEnvironment): boolean {
     return fs.existsSync(environment.execInfo.run.executable);
+  }
+
+  private async environmentIsReady(record: RiotEnvironmentRecord): Promise<boolean> {
+    return (
+      this.environmentExecutableExists(record.environment) &&
+      (await this.cliService.isVenvReady(record.context.hash, record.workspaceRoot))
+    );
   }
 
   private matchesPath(environment: PythonEnvironment, targetPath: string): boolean {

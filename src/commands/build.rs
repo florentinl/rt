@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::Write as FmtWrite,
     fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, OnceLock},
@@ -16,17 +16,16 @@ use crate::{
         MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId,
         StepOutcome, Task, TaskRunner, summarize_errors,
     },
+    uv_project::{ensure_uv_project, has_pkg},
     venv::{ExecutionContext, RiotVenv, venv_path},
 };
 use indexmap::IndexMap;
-use itertools::Itertools;
-use tempfile::{Builder, NamedTempFile};
 
 use rayon::current_num_threads;
 
 use crate::{
     config::RepoConfig,
-    constants::{DONE_MARKER, RT_VERSION, VENV_DEPS_DIR, VENV_SELF_DIR},
+    constants::{DONE_MARKER, RT_VERSION},
     venv::select_execution_contexts,
 };
 
@@ -62,7 +61,7 @@ pub fn collect_context_indices(selected: &[RiotVenv]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Build every selected execution context and its shared dependencies.
+/// Build every selected execution context.
 ///
 /// # Errors
 ///
@@ -95,39 +94,14 @@ pub fn build_selected_contexts(
         Arc::clone(&repo.build_env),
         Arc::clone(&repo.run_env),
         repo.riot_root.clone(),
+        repo.riotfile_path
+            .parent()
+            .ok_or_else(|| RtError::message("error: could not find riotfile parent"))?
+            .to_path_buf(),
     ));
     let runner = TaskRunner::new(Arc::clone(&sink)).with_parallelism(Some(current_num_threads()));
 
     let context_indices = collect_context_indices(selected);
-
-    let mut dev_pythons: HashSet<String> = HashSet::new();
-    let mut deps_targets: HashSet<usize> = HashSet::new();
-    for (venv_idx, ctx_idx) in &context_indices {
-        let selected_venv = &selected[*venv_idx];
-        let exc = &selected_venv.execution_contexts[*ctx_idx];
-        if !exc.skip_dev_install {
-            dev_pythons.insert(selected_venv.python.clone());
-        }
-        deps_targets.insert(*venv_idx);
-    }
-
-    let mut setup_tasks: Vec<_> = Vec::new();
-    setup_tasks.extend(dev_pythons.into_iter().map(|python| {
-        let state = Arc::clone(&shared);
-        let step_id = format!("dev install {python}");
-        Task::new(StepId::new(&step_id), &step_id, move |ctx| {
-            state.ensure_dev_install(&python, &ctx)
-        })
-    }));
-
-    setup_tasks.extend(deps_targets.into_iter().map(|idx| {
-        let state = Arc::clone(&shared);
-        let venv = &selected[idx];
-        let step_id = format!("deps install {}", venv.hash);
-        Task::new(StepId::new(&step_id), &step_id, move |ctx| {
-            state.ensure_deps_install(venv, &ctx)
-        })
-    }));
 
     let exc_ctx_tasks: Vec<_> = context_indices
         .iter()
@@ -135,27 +109,12 @@ pub fn build_selected_contexts(
             let state = Arc::clone(&shared);
             let venv = &selected[venv_i];
             let exc_ctx = &venv.execution_contexts[exc_i];
-            let step_id = format!("create execution context {}", exc_ctx.hash);
+            let step_id = format!("sync execution context {}", exc_ctx.hash);
             Task::new(StepId::new(&step_id), &step_id, move |ctx| {
                 state.ensure_execution_ctx(venv, exc_ctx, &ctx)
             })
         })
         .collect();
-
-    // Pre-register phase-2 tasks so the total count is correct from the start.
-    for task in &exc_ctx_tasks {
-        sink.register_step(&task.id, &task.label);
-    }
-
-    let setup_errors = runner.run(setup_tasks).map_err(|err| {
-        RtError::message(format!(
-            "error: could not configure build parallelism ({err})"
-        ))
-    })?;
-
-    if summarize_errors(&setup_errors, "build") {
-        return Err(RtError::silent(1));
-    }
 
     let exc_errors = runner.run(exc_ctx_tasks).map_err(|err| {
         RtError::message(format!(
@@ -178,6 +137,7 @@ pub struct BuildSharedState {
     build_env: Arc<HashMap<String, String>>,
     run_env: Arc<HashMap<String, String>>,
     riot_root: PathBuf,
+    project_root: PathBuf,
 }
 
 impl BuildSharedState {
@@ -188,6 +148,7 @@ impl BuildSharedState {
         build_env: Arc<HashMap<String, String>>,
         run_env: Arc<HashMap<String, String>>,
         riot_root: PathBuf,
+        project_root: PathBuf,
     ) -> Self {
         Self {
             force_reinstall,
@@ -195,123 +156,8 @@ impl BuildSharedState {
             build_env,
             run_env,
             riot_root,
+            project_root,
         }
-    }
-
-    fn ensure_dev_install(&self, python: &str, ctx: &StepContext) -> DynResult<StepOutcome> {
-        let dev_install_path = get_dev_install_path(&self.riot_root, python, self.no_editable);
-
-        let marker_path = dev_install_path.join(DONE_MARKER);
-        if self.can_reuse(&marker_path, ctx) {
-            return Ok(StepOutcome::Cached);
-        }
-
-        if dev_install_path.exists() {
-            fs::remove_dir_all(&dev_install_path)?;
-        }
-        fs::create_dir_all(&dev_install_path)?;
-
-        let mut cmd = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone())
-            .envs(self.build_env.as_ref())
-            .env("DD_FAST_BUILD", "1")
-            .arg("install")
-            .arg("-v")
-            .arg("--system")
-            .arg("--python")
-            .arg(python)
-            .arg("--target")
-            .arg(&dev_install_path);
-
-        cmd = if self.no_editable {
-            cmd.arg(".")
-        } else {
-            cmd.args(["-e", "."])
-                .args(["--config-setting", "editable_mode=compat"])
-        };
-
-        let status = cmd.status()?;
-
-        if !status.success() {
-            return Err(RtError::message(format!(
-                "error: uv pip install failed with status {status}"
-            )));
-        }
-
-        write_marker(&marker_path)?;
-
-        Ok(StepOutcome::Done)
-    }
-
-    fn get_requirements_file(venv: &RiotVenv) -> DynResult<NamedTempFile> {
-        let mut requirements = if venv.resolved_pkgs.is_empty() {
-            format_requirements(&venv.pkgs)
-        } else {
-            format_resolved_requirements(&venv.resolved_pkgs)
-        }
-        .replace("/home/bits/project", ".");
-
-        for extra in extra_requirements(venv) {
-            requirements.push_str(&extra);
-            requirements.push('\n');
-        }
-
-        let mut temp = Builder::new().suffix(".txt").tempfile()?;
-        temp.write_all(requirements.as_bytes())?;
-        temp.flush()?;
-
-        Ok(temp)
-    }
-
-    fn ensure_deps_install(&self, venv: &RiotVenv, ctx: &StepContext) -> DynResult<StepOutcome> {
-        let mut deps_install_path = self.riot_root.clone();
-        deps_install_path.push(VENV_DEPS_DIR);
-        deps_install_path.push(format!("deps_{}", venv.hash));
-
-        let requirements_file = Self::get_requirements_file(venv)?;
-
-        let marker_path = deps_install_path.join(DONE_MARKER);
-        if self.can_reuse(&marker_path, ctx) {
-            return Ok(StepOutcome::Cached);
-        }
-
-        if deps_install_path.exists() {
-            fs::remove_dir_all(&deps_install_path)?;
-        }
-        fs::create_dir_all(&deps_install_path)?;
-
-        let mut cmd = ManagedCommand::new_uv("pip", Arc::clone(&ctx.sink), ctx.step_id.clone());
-
-        // pylibmc has no wheels: it compiles against libmemcached, which the CI
-        // image installs system-wide (libmemcached-dev). On developer machines
-        // the headers usually live under a Homebrew prefix, so point the build
-        // at it. Applied before build_env so rt.toml can still override it.
-        if has_pkg(venv, "pylibmc")
-            && let Some(prefix) = libmemcached_prefix()
-        {
-            cmd = cmd.env("LIBMEMCACHED", prefix);
-        }
-
-        let status = cmd
-            .envs(self.build_env.as_ref())
-            .arg("install")
-            .arg("--system")
-            .arg("--python")
-            .arg(&venv.python)
-            .arg("--target")
-            .arg(&deps_install_path)
-            .arg("--requirement")
-            .arg(requirements_file.path())
-            .status()?;
-
-        if !status.success() {
-            return Err(RtError::message(format!(
-                "error: uv pip install failed with status {status}"
-            )));
-        }
-
-        write_marker(&marker_path)?;
-
-        Ok(StepOutcome::Done)
     }
 
     fn ensure_execution_ctx(
@@ -323,120 +169,71 @@ impl BuildSharedState {
         let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
         let marker_path = exc_venv_path.join(DONE_MARKER);
 
-        if self.can_reuse(&marker_path, ctx) {
-            return Ok(StepOutcome::Cached);
+        if self.force_reinstall && exc_venv_path.exists() {
+            fs::remove_dir_all(&exc_venv_path)?;
         }
 
-        if marker_path.is_file() {
-            fs::remove_file(&marker_path)?;
+        let uv_project = ensure_uv_project(&self.riot_root, &self.project_root, venv, exc)?;
+
+        let mut cmd = ManagedCommand::new_uv("sync", Arc::clone(&ctx.sink), ctx.step_id.clone());
+
+        // pylibmc has no wheels: it compiles against libmemcached, which the CI
+        // image installs system-wide (libmemcached-dev). On developer machines
+        // the headers usually live under a Homebrew prefix, so point the build
+        // at it. Applied before build_env so rt.toml can still override it.
+        if has_pkg(venv, "pylibmc")
+            && let Some(prefix) = libmemcached_prefix()
+        {
+            cmd = cmd.env("LIBMEMCACHED", prefix);
         }
 
-        let deps_install_path = get_deps_install_path(&self.riot_root, &venv.hash);
-        let dev_install_path = (!exc.skip_dev_install).then_some(get_dev_install_path(
-            &self.riot_root,
-            &venv.python,
-            self.no_editable,
-        ));
-
-        let status = ManagedCommand::new_uv("venv", Arc::clone(&ctx.sink), ctx.step_id.clone())
+        cmd = cmd
             .envs(self.build_env.as_ref())
+            .env("DD_FAST_BUILD", "1")
+            .env("UV_PROJECT_ENVIRONMENT", &exc_venv_path)
+            .arg("--project")
+            .arg(&uv_project)
             .arg("--python")
-            .arg(&venv.python)
-            .arg("--clear")
-            .arg(&exc_venv_path)
-            .status()?;
+            .arg(&venv.python);
+
+        if self.force_reinstall {
+            cmd = cmd.arg("--reinstall");
+        }
+
+        if self.no_editable {
+            cmd = cmd.arg("--no-editable");
+        } else {
+            cmd = cmd.args(["--config-setting", "editable_mode=compat"]);
+        }
+
+        let status = cmd.status()?;
 
         if !status.success() {
             return Err(RtError::message(format!(
-                "error: uv venv failed with status {status}"
+                "error: uv sync failed with status {status}"
             )));
         }
 
         let site_packages_path =
             exc_venv_path.join(format!("lib/python{}/site-packages", &venv.python));
 
-        self.configure_site_packages(
-            venv,
-            exc,
-            &deps_install_path,
-            dev_install_path.as_ref(),
-            &site_packages_path,
-        )?;
-
-        let mut bin_sources: Vec<&Path> = Vec::new();
-        if let Some(ref dev_install_path) = dev_install_path {
-            bin_sources.push(dev_install_path);
-        }
-        bin_sources.push(&deps_install_path);
-        merge_bin_dirs(&exc_venv_path, &bin_sources)?;
+        self.configure_site_packages(venv, exc, &site_packages_path)?;
 
         write_marker(&marker_path)?;
 
         Ok(StepOutcome::Done)
     }
 
-    /// Whether the directory guarded by `marker_path` can be reused as-is.
-    ///
-    /// A directory is only reusable when it was produced by this exact `rt`
-    /// version. When a marker from another version is found the reason is
-    /// reported, otherwise the rebuild would look like an unexplained cache
-    /// miss.
-    fn can_reuse(&self, marker_path: &Path, ctx: &StepContext) -> bool {
-        if self.force_reinstall {
-            return false;
-        }
-
-        match read_marker(marker_path) {
-            MarkerState::Current => true,
-            MarkerState::Missing => false,
-            MarkerState::Stale(previous) => {
-                let previous = previous.map_or_else(
-                    || "an unversioned rt build".to_owned(),
-                    |version| format!("rt {version}"),
-                );
-                ctx.sink.append_output(
-                    &ctx.step_id,
-                    format!("cache built by {previous}, rebuilding for rt {RT_VERSION}\n"),
-                );
-                false
-            }
-        }
-    }
-
     fn configure_site_packages(
         &self,
         venv: &RiotVenv,
         exc: &ExecutionContext,
-        deps_install_path: &Path,
-        dev_install_path: Option<&PathBuf>,
         site_packages_path: &Path,
     ) -> RtResult<()> {
         fs::create_dir_all(site_packages_path)?;
 
-        let current_dir = self
-            .riot_root
-            .parent()
-            .ok_or_else(|| RtError::message("error: could not find riot root parent"))?;
-
-        let mut paths = vec![];
-        if let Some(dev_install_path) = dev_install_path {
-            paths.push((current_dir.to_string_lossy(), "current project"));
-            paths.push((
-                dev_install_path.to_string_lossy(),
-                "current project dependencies",
-            ));
-        }
-        paths.push((deps_install_path.to_string_lossy(), "riot dependencies"));
-
-        {
-            // pth file is mostly for analysis tools that do not execute sitecustomize.py to query site dirs
-            let pth_file = site_packages_path.join("riot.pth");
-            let pth_content = paths
-                .iter()
-                .map(|(path, comment)| format!("# {comment}\n{path}"))
-                .join("\n");
-            fs::write(pth_file, pth_content)?;
-        }
+        let current_dir =
+            fs::canonicalize(&self.project_root).unwrap_or_else(|_| self.project_root.clone());
 
         {
             fs::write(
@@ -450,17 +247,16 @@ impl BuildSharedState {
         }
 
         // envier is a ddtrace runtime dependency, so it lands in the venv
-        // through the dev install rather than through a riotfile package. The
-        // rare venv that skips the dev install only has it when the riotfile
-        // asks for it explicitly.
+        // through the local project dependency rather than through a riotfile
+        // package. A context that skips the project only has it when the
+        // riotfile asks for it explicitly.
         if !exc.skip_dev_install || has_pkg(venv, "envier") {
             write_envier_stubs(site_packages_path)?;
         }
 
         self.write_sitecustomize(
             site_packages_path,
-            current_dir,
-            &paths,
+            &current_dir,
             exc,
             &venv.services,
             &venv.suite_env,
@@ -469,24 +265,17 @@ impl BuildSharedState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn write_sitecustomize(
         &self,
         site_packages_path: &Path,
         current_dir: &Path,
-        paths: &[(std::borrow::Cow<'_, str>, &str)],
         exc: &ExecutionContext,
         services: &[String],
         suite_env: &IndexMap<String, String>,
     ) -> RtResult<()> {
         let sitecustomize_path = site_packages_path.join("sitecustomize.py");
         let mut sc = String::new();
-        sc.push_str("import site, os\n");
-
-        // adding paths in sitecustomize is necessary to include .pth files in each of these folders
-        for (path, comment) in paths {
-            writeln!(sc, "site.addsitedir(r\"{path}\") # {comment}")?;
-        }
+        sc.push_str("import os\n");
 
         if self.no_editable {
             // In non-editable mode the installed package must take precedence
@@ -613,73 +402,8 @@ fn write_envier_stubs(site_packages_path: &Path) -> RtResult<()> {
     Ok(())
 }
 
-/// State of a `DONE_MARKER` relative to the running `rt` version.
-#[derive(Debug, PartialEq, Eq)]
-enum MarkerState {
-    /// Written by this exact `rt` version: the cached build is reusable.
-    Current,
-    /// No marker at all: nothing was ever built here.
-    Missing,
-    /// Written by another `rt` version, or by a version that did not stamp
-    /// itself yet (empty marker, `rt` <= 1.0.2).
-    Stale(Option<String>),
-}
-
-fn read_marker(marker_path: &Path) -> MarkerState {
-    let Ok(contents) = fs::read_to_string(marker_path) else {
-        return if marker_path.is_file() {
-            // Present but unreadable (or not UTF-8): treat as untrusted.
-            MarkerState::Stale(None)
-        } else {
-            MarkerState::Missing
-        };
-    };
-
-    let stamp = contents.trim();
-    if stamp == RT_VERSION {
-        MarkerState::Current
-    } else {
-        MarkerState::Stale((!stamp.is_empty()).then(|| stamp.to_owned()))
-    }
-}
-
 fn write_marker(marker_path: &Path) -> io::Result<()> {
     fs::write(marker_path, format!("{RT_VERSION}\n"))
-}
-
-/// Normalize a requirement name the way PEP 503 does, so `Types_Mock` and
-/// `types-mock` compare equal.
-fn normalize_pkg_name(name: &str) -> String {
-    name.split('[')
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .to_lowercase()
-        .replace(['_', '.'], "-")
-}
-
-/// Whether `pkg` is part of this venv, either declared in the riotfile or
-/// pulled in by the compiled lockfile.
-fn has_pkg(venv: &RiotVenv, pkg: &str) -> bool {
-    let target = normalize_pkg_name(pkg);
-    venv.pkgs
-        .keys()
-        .chain(venv.resolved_pkgs.keys())
-        .any(|name| normalize_pkg_name(name) == target)
-}
-
-/// Requirements `rt` adds on top of the riotfile ones.
-///
-/// `mock` ships no inline types, so IDE/type-checker integrations report every
-/// `mock` import as untyped unless the stubs are installed next to it.
-fn extra_requirements(venv: &RiotVenv) -> Vec<String> {
-    let mut extras = Vec::new();
-
-    if has_pkg(venv, "mock") && !has_pkg(venv, "types-mock") {
-        extras.push("types-mock".to_owned());
-    }
-
-    extras
 }
 
 /// Locate a libmemcached installation for building `pylibmc`.
@@ -730,173 +454,11 @@ fn brew_prefix(formula: &str) -> Option<PathBuf> {
     (!prefix.is_empty()).then(|| PathBuf::from(prefix))
 }
 
-fn get_dev_install_path(riot_root: &Path, python: &str, no_editable: bool) -> PathBuf {
-    let python_no_dot = python.replace('.', "");
-    let suffix = if no_editable { "_noedit" } else { "" };
-    let mut dev_install_path = riot_root.to_path_buf();
-    dev_install_path.push(VENV_SELF_DIR);
-    dev_install_path.push(format!("self_py{python_no_dot}{suffix}"));
-    dev_install_path
-}
-
-fn get_deps_install_path(riot_root: &Path, hash: &str) -> PathBuf {
-    let mut deps_install_path = riot_root.to_path_buf();
-    deps_install_path.push(VENV_DEPS_DIR);
-    deps_install_path.push(format!("deps_{hash}"));
-    deps_install_path
-}
-
-fn format_requirements(pkgs: &IndexMap<String, String>) -> String {
-    if pkgs.is_empty() {
-        return String::new();
-    }
-
-    let mut buf = String::new();
-    for (idx, (lib, version)) in pkgs.iter().enumerate() {
-        if idx > 0 {
-            buf.push('\n');
-        }
-        buf.push_str(lib);
-        buf.push_str(version);
-    }
-    buf.push('\n');
-    buf
-}
-
-fn format_resolved_requirements(resolved_pkgs: &IndexMap<String, String>) -> String {
-    if resolved_pkgs.is_empty() {
-        return String::new();
-    }
-
-    let mut buf = String::new();
-    for (idx, (lib, version)) in resolved_pkgs.iter().enumerate() {
-        if idx > 0 {
-            buf.push('\n');
-        }
-        buf.push_str(lib);
-        buf.push_str("==");
-        buf.push_str(version);
-    }
-    buf.push('\n');
-    buf
-}
-
-fn merge_bin_dirs(venv_path: &Path, sources: &[&Path]) -> io::Result<()> {
-    let target_bin = venv_path.join("bin");
-    let absolute_venv = fs::canonicalize(venv_path).unwrap_or_else(|_| venv_path.to_path_buf());
-    let python_exe = absolute_venv.join("bin/python");
-    let python_shebang = format!("#!{}\n", python_exe.to_string_lossy());
-
-    for source in sources {
-        let source_bin = source.join("bin");
-        if !source_bin.exists() {
-            continue;
-        }
-        for entry in fs::read_dir(&source_bin)? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                continue;
-            }
-            let target = target_bin.join(entry.file_name());
-            if target.exists() {
-                fs::remove_file(&target)?;
-            }
-
-            let content = fs::read(&path)?;
-            let rewritten = rewrite_python_shebang(&content, &python_shebang);
-            let data = rewritten.as_ref().unwrap_or(&content);
-            fs::write(&target, data)?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = metadata.permissions().mode();
-                fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn rewrite_python_shebang(content: &[u8], python_shebang: &str) -> Option<Vec<u8>> {
-    if !content.starts_with(b"#!") {
-        return None;
-    }
-
-    let line_end = content
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(content.len());
-    let shebang_line = &content[..line_end];
-    let shebang_str = std::str::from_utf8(shebang_line).ok()?;
-
-    if !shebang_str.to_ascii_lowercase().contains("python") {
-        return None;
-    }
-
-    let rest_start = if line_end < content.len() {
-        line_end + 1
-    } else {
-        content.len()
-    };
-    let rest = &content[rest_start..];
-
-    let mut rewritten = Vec::with_capacity(python_shebang.len() + rest.len());
-    rewritten.extend_from_slice(python_shebang.as_bytes());
-    rewritten.extend_from_slice(rest);
-    Some(rewritten)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ENVIER_STUBS, MarkerState, extra_requirements, has_pkg, normalize_pkg_name, read_marker,
-        write_envier_stubs, write_marker,
-    };
+    use super::{ENVIER_STUBS, write_envier_stubs, write_marker};
     use crate::constants::{DONE_MARKER, RT_VERSION};
-    use crate::venv::RiotVenv;
-    use indexmap::IndexMap;
     use std::fs;
-
-    fn venv_with(pkgs: &[(&str, &str)], resolved: &[(&str, &str)]) -> RiotVenv {
-        let mut venv = RiotVenv::empty_for_tests();
-        venv.pkgs = pkgs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect::<IndexMap<_, _>>();
-        venv.resolved_pkgs = resolved
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect::<IndexMap<_, _>>();
-        venv
-    }
-
-    #[test]
-    fn pkg_names_are_normalized_like_pep503() {
-        assert_eq!(normalize_pkg_name("Types_Mock"), "types-mock");
-        assert_eq!(normalize_pkg_name("coverage[toml]"), "coverage");
-        assert_eq!(normalize_pkg_name("ruamel.yaml"), "ruamel-yaml");
-    }
-
-    #[test]
-    fn mock_pulls_in_its_stubs() {
-        let venv = venv_with(&[("mock", ""), ("pytest", "")], &[]);
-        assert_eq!(extra_requirements(&venv), vec!["types-mock".to_owned()]);
-    }
-
-    #[test]
-    fn mock_stubs_are_not_duplicated() {
-        let venv = venv_with(&[("mock", "")], &[("types-mock", "5.2.0")]);
-        assert!(extra_requirements(&venv).is_empty());
-    }
-
-    #[test]
-    fn venvs_without_mock_get_no_extras() {
-        let venv = venv_with(&[("pytest", "")], &[("pytest-mock", "3.12.0")]);
-        assert!(extra_requirements(&venv).is_empty());
-    }
 
     #[test]
     fn envier_stubs_are_written_as_a_pep561_stub_package() {
@@ -931,51 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn marker_written_by_this_version_is_reusable() {
+    fn marker_records_the_rt_version() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join(DONE_MARKER);
 
         write_marker(&marker).unwrap();
 
         assert_eq!(fs::read_to_string(&marker).unwrap().trim(), RT_VERSION);
-        assert_eq!(read_marker(&marker), MarkerState::Current);
-    }
-
-    #[test]
-    fn marker_from_another_version_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(DONE_MARKER);
-        fs::write(&marker, "0.9.0\n").unwrap();
-
-        assert_eq!(
-            read_marker(&marker),
-            MarkerState::Stale(Some("0.9.0".to_owned()))
-        );
-    }
-
-    #[test]
-    fn legacy_empty_marker_is_stale_without_a_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(DONE_MARKER);
-        fs::write(&marker, "").unwrap();
-
-        assert_eq!(read_marker(&marker), MarkerState::Stale(None));
-    }
-
-    #[test]
-    fn absent_marker_is_missing_not_stale() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert_eq!(
-            read_marker(&dir.path().join(DONE_MARKER)),
-            MarkerState::Missing
-        );
-    }
-
-    #[test]
-    fn pkgs_are_detected_in_the_lockfile_too() {
-        let venv = venv_with(&[("django-pylibmc", ">=0.6,<0.7")], &[("pylibmc", "1.6.3")]);
-        assert!(has_pkg(&venv, "pylibmc"));
-        assert!(!has_pkg(&venv, "memcache"));
     }
 }
