@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "rt-runtime"
-version = "1.4.0"
+version = "1.5.0"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["vendor/types-envier/LICENSE"]
