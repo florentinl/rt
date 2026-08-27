@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use toml::{Table, Value};
 
 use crate::{
+    constants::{RT_VERSION, RUNTIME_DISTRIBUTION},
     error::{RtError, RtResult},
     venv::{ExecutionContext, RiotVenv},
 };
@@ -24,6 +25,7 @@ pub const UV_PROJECTS_DIR: &str = "venv_uv_projects";
 pub fn ensure_uv_project(
     riot_root: &Path,
     project_root: &Path,
+    runtime_project: &Path,
     venv: &RiotVenv,
     exc: &ExecutionContext,
 ) -> RtResult<PathBuf> {
@@ -33,16 +35,30 @@ pub fn ensure_uv_project(
             project_root.display()
         ))
     })?;
+    let runtime_project = fs::canonicalize(runtime_project).map_err(|err| {
+        RtError::message(format!(
+            "error: failed to resolve rt runtime project {}: {err}",
+            runtime_project.display()
+        ))
+    })?;
     let local_project_name = (!exc.skip_dev_install)
         .then(|| read_project_name(&project_root))
         .transpose()?;
-    let requirements = environment_requirements(venv, local_project_name.as_deref(), &project_root);
+    let mut requirements =
+        environment_requirements(venv, local_project_name.as_deref(), &project_root);
+    requirements.push(format!("{RUNTIME_DISTRIBUTION}=={RT_VERSION}"));
     let local_project = local_project_name
         .as_deref()
         .map(|name| (name, project_root.as_path()));
-    let project_id = project_id(&venv.python, &requirements, local_project);
+    let project_id = project_id(&venv.python, &requirements, local_project, &runtime_project);
     let generated_name = format!("rt-generated-{}", &project_id[..16]);
-    let contents = render_project(&generated_name, &venv.python, &requirements, local_project)?;
+    let contents = render_project(
+        &generated_name,
+        &venv.python,
+        &requirements,
+        local_project,
+        &runtime_project,
+    )?;
 
     let project_dir = riot_root.join(UV_PROJECTS_DIR).join(project_id);
     fs::create_dir_all(&project_dir)?;
@@ -57,6 +73,7 @@ fn project_id(
     python: &str,
     requirements: &[String],
     local_project: Option<(&str, &Path)>,
+    runtime_project: &Path,
 ) -> String {
     fn update(hasher: &mut Sha256, value: &[u8]) {
         let length = u64::try_from(value.len()).expect("project metadata length fits in u64");
@@ -77,6 +94,8 @@ fn project_id(
     } else {
         update(&mut hasher, b"no-local-project");
     }
+    update(&mut hasher, b"rt-runtime");
+    update(&mut hasher, runtime_project.to_string_lossy().as_bytes());
 
     let digest = hasher.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -169,6 +188,7 @@ fn render_project(
     python: &str,
     requirements: &[String],
     local_project: Option<(&str, &Path)>,
+    runtime_project: &Path,
 ) -> RtResult<String> {
     let mut project = Table::new();
     project.insert("name".to_owned(), Value::String(generated_name.to_owned()));
@@ -184,6 +204,7 @@ fn render_project(
 
     let mut uv = Table::new();
     uv.insert("package".to_owned(), Value::Boolean(false));
+    let mut sources = Table::new();
     if let Some((name, path)) = local_project {
         let mut source = Table::new();
         source.insert(
@@ -192,10 +213,20 @@ fn render_project(
         );
         source.insert("editable".to_owned(), Value::Boolean(true));
 
-        let mut sources = Table::new();
         sources.insert(name.to_owned(), Value::Table(source));
-        uv.insert("sources".to_owned(), Value::Table(sources));
     }
+
+    let mut runtime_source = Table::new();
+    runtime_source.insert(
+        "path".to_owned(),
+        Value::String(runtime_project.to_string_lossy().into_owned()),
+    );
+    runtime_source.insert("editable".to_owned(), Value::Boolean(false));
+    sources.insert(
+        RUNTIME_DISTRIBUTION.to_owned(),
+        Value::Table(runtime_source),
+    );
+    uv.insert("sources".to_owned(), Value::Table(sources));
 
     let mut tool = Table::new();
     tool.insert("uv".to_owned(), Value::Table(uv));
@@ -258,17 +289,20 @@ pub fn has_pkg(venv: &RiotVenv, pkg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{UV_PROJECTS_DIR, ensure_uv_project, normalize_pkg_name};
+    use crate::constants::{RT_VERSION, RUNTIME_DISTRIBUTION};
     use crate::venv::{ExecutionContext, RiotVenv};
     use indexmap::IndexMap;
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
-    fn fixture(skip_dev_install: bool) -> (tempfile::TempDir, RiotVenv, ExecutionContext) {
+    fn fixture(skip_dev_install: bool) -> (tempfile::TempDir, PathBuf, RiotVenv, ExecutionContext) {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("pyproject.toml"),
             "[project]\nname = \"example-project\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
+        let runtime_project = dir.path().join("rt-runtime");
+        fs::create_dir(&runtime_project).unwrap();
 
         let mut venv = RiotVenv::empty_for_tests();
         venv.python = "3.11".to_owned();
@@ -282,15 +316,16 @@ mod tests {
             skip_dev_install,
             hash: "abc1234@def5678".to_owned(),
         };
-        (dir, venv, exc)
+        (dir, runtime_project, venv, exc)
     }
 
     #[test]
     fn generated_project_contains_dependencies_and_an_editable_local_source() {
-        let (dir, venv, exc) = fixture(false);
+        let (dir, runtime_project, venv, exc) = fixture(false);
         let riot_root = dir.path().join(".riot");
 
-        let generated = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let generated =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
         assert_eq!(
             generated.parent(),
             Some(riot_root.join(UV_PROJECTS_DIR).as_path())
@@ -302,6 +337,10 @@ mod tests {
         let dependencies = parsed["project"]["dependencies"].as_array().unwrap();
         assert_eq!(dependencies[0].as_str(), Some("example-project"));
         assert_eq!(dependencies[1].as_str(), Some("pytest>=8,<9"));
+        assert_eq!(
+            dependencies[2].as_str(),
+            Some(format!("{RUNTIME_DISTRIBUTION}=={RT_VERSION}").as_str())
+        );
         assert_eq!(
             parsed["tool"]["uv"]["sources"]["example-project"]["path"].as_str(),
             Some(
@@ -317,6 +356,20 @@ mod tests {
             Some(true)
         );
         assert_eq!(
+            parsed["tool"]["uv"]["sources"][RUNTIME_DISTRIBUTION]["path"].as_str(),
+            Some(
+                runtime_project
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            parsed["tool"]["uv"]["sources"][RUNTIME_DISTRIBUTION]["editable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
             parsed["project"]["requires-python"].as_str(),
             Some(">=3.11,<3.12")
         );
@@ -324,40 +377,61 @@ mod tests {
 
     #[test]
     fn execution_contexts_with_the_same_dependencies_share_a_project() {
-        let (dir, venv, mut exc) = fixture(false);
+        let (dir, runtime_project, venv, mut exc) = fixture(false);
         let riot_root = dir.path().join(".riot");
 
-        let first = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let first =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
         exc.hash = "abc1234@another".to_owned();
         exc.command = Some("pytest another/test.py".to_owned());
         exc.env.insert("EXAMPLE".to_owned(), "different".to_owned());
-        let second = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let second =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
 
         assert_eq!(first, second);
     }
 
     #[test]
     fn dependency_changes_use_a_different_project() {
-        let (dir, mut venv, exc) = fixture(false);
+        let (dir, runtime_project, mut venv, exc) = fixture(false);
         let riot_root = dir.path().join(".riot");
 
-        let first = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let first =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
         venv.pkgs
             .insert("coverage".to_owned(), "==7.10.0".to_owned());
-        let second = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let second =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn runtime_source_changes_use_a_different_project() {
+        let (dir, runtime_project, venv, exc) = fixture(false);
+        let riot_root = dir.path().join(".riot");
+        let other_runtime_project = dir.path().join("other-rt-runtime");
+        fs::create_dir(&other_runtime_project).unwrap();
+
+        let first =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
+        let second =
+            ensure_uv_project(&riot_root, dir.path(), &other_runtime_project, &venv, &exc).unwrap();
 
         assert_ne!(first, second);
     }
 
     #[test]
     fn a_damaged_generated_manifest_is_replaced() {
-        let (dir, venv, exc) = fixture(false);
+        let (dir, runtime_project, venv, exc) = fixture(false);
         let riot_root = dir.path().join(".riot");
-        let generated = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let generated =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
         let manifest = generated.join("pyproject.toml");
         fs::write(&manifest, "incomplete").unwrap();
 
-        let regenerated = ensure_uv_project(&riot_root, dir.path(), &venv, &exc).unwrap();
+        let regenerated =
+            ensure_uv_project(&riot_root, dir.path(), &runtime_project, &venv, &exc).unwrap();
 
         assert_eq!(generated, regenerated);
         assert!(fs::read_to_string(manifest).unwrap().contains("[project]"));
@@ -365,21 +439,34 @@ mod tests {
 
     #[test]
     fn skip_dev_install_omits_the_local_project() {
-        let (dir, venv, exc) = fixture(true);
-        let generated =
-            ensure_uv_project(&dir.path().join(".riot"), dir.path(), &venv, &exc).unwrap();
+        let (dir, runtime_project, venv, exc) = fixture(true);
+        let generated = ensure_uv_project(
+            &dir.path().join(".riot"),
+            dir.path(),
+            &runtime_project,
+            &venv,
+            &exc,
+        )
+        .unwrap();
         let contents = fs::read_to_string(generated.join("pyproject.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&contents).unwrap();
 
         let dependencies = parsed["project"]["dependencies"].as_array().unwrap();
-        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies.len(), 2);
         assert_eq!(dependencies[0].as_str(), Some("pytest>=8,<9"));
-        assert!(parsed["tool"]["uv"].get("sources").is_none());
+        assert_eq!(
+            dependencies[1].as_str(),
+            Some(format!("{RUNTIME_DISTRIBUTION}=={RT_VERSION}").as_str())
+        );
+        assert_eq!(
+            parsed["tool"]["uv"]["sources"][RUNTIME_DISTRIBUTION]["editable"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]
     fn resolved_requirements_win_without_duplicating_the_local_project() {
-        let (dir, mut venv, exc) = fixture(false);
+        let (dir, runtime_project, mut venv, exc) = fixture(false);
         venv.pkgs.insert("mock".to_owned(), String::new());
         venv.resolved_pkgs = [
             ("example-project".to_owned(), "0.9.0".to_owned()),
@@ -388,8 +475,14 @@ mod tests {
         .into_iter()
         .collect();
 
-        let generated =
-            ensure_uv_project(&dir.path().join(".riot"), dir.path(), &venv, &exc).unwrap();
+        let generated = ensure_uv_project(
+            &dir.path().join(".riot"),
+            dir.path(),
+            &runtime_project,
+            &venv,
+            &exc,
+        )
+        .unwrap();
         let contents = fs::read_to_string(generated.join("pyproject.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&contents).unwrap();
         let requirements = parsed["project"]["dependencies"]
@@ -401,7 +494,12 @@ mod tests {
 
         assert_eq!(
             requirements,
-            ["example-project", "mock==5.2.0", "types-mock"]
+            [
+                "example-project",
+                "mock==5.2.0",
+                "types-mock",
+                format!("{RUNTIME_DISTRIBUTION}=={RT_VERSION}").as_str(),
+            ]
         );
     }
 

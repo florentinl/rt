@@ -1,0 +1,1 @@
+import _rt_runtime; _rt_runtime.startup()

@@ -28,12 +28,22 @@ use crate::{
 use clap::{Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 type DefaultConfigProvider = crate::config_provider::RiotConfigProvider;
+static RUNTIME_PROJECT: OnceLock<PathBuf> = OnceLock::new();
 
 #[pymodule]
 fn _rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let module_path = PathBuf::from(m.filename()?.to_str()?);
+    let module_dir = module_path.parent().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("rt native module has no parent directory")
+    })?;
+    RUNTIME_PROJECT.get_or_init(|| module_dir.join("_runtime_project"));
+
     m.add_function(wrap_pyfunction!(cli_main, m)?)?;
     m.add_class::<config_provider::PyVenv>()?;
     Ok(())
@@ -390,6 +400,13 @@ pub fn load_context_with_default_provider(
     riot_root: Option<&Path>,
 ) -> RtResult<IndexMap<String, RiotVenv>> {
     load_context::<DefaultConfigProvider>(riotfile_path, riot_root)
+}
+
+fn runtime_project_path() -> RtResult<PathBuf> {
+    RUNTIME_PROJECT
+        .get()
+        .cloned()
+        .ok_or_else(|| RtError::message("error: could not locate the bundled rt runtime project"))
 }
 
 fn try_main(args: Vec<String>) -> RtResult<()> {

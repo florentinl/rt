@@ -70,13 +70,21 @@ dependencies, while packages coming from the resolved lockfile are marked as
 transitive. Riot environments remain read-only in VS Code: edit `riotfile.py`
 and refresh or rebuild instead of installing or removing packages in place.
 
+### Managed Runtime
+
+Every generated environment includes the bundled `rt-runtime` package. It owns
+the Python startup hook, pytest integration, and typing stubs; uv builds it once
+and reuses the cached wheel across compatible environments. The only context
+file written by rt is `<venv>/rt_config.json`, which also records the rt version
+used to complete the environment.
+
 ### Typed `envier` Settings
 
 `envier` ships no `py.typed` marker, so every setting declared through it shows
-up as untyped in the editor. The `rt` runtime embeds a vendored `types-envier`
-stub package and drops it into each environment that gets `envier` - class
-access resolves to `EnvVariable[T]`, instance access to `T`. Nothing to install:
-see `vendor/types-envier/VENDORING.md`.
+up as untyped in the editor. The `rt-runtime` package installs a vendored
+`types-envier` stub package in every managed environment - class access resolves
+to `EnvVariable[T]`, instance access to `T`. See
+`rt/_runtime_project/vendor/types-envier/VENDORING.md`.
 
 ### Service Containers
 

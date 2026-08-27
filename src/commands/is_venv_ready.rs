@@ -1,10 +1,25 @@
 use std::{fs, path::Path};
 
 use crate::{
-    constants::{DONE_MARKER, RT_VERSION},
+    constants::{RT_VERSION, RUNTIME_CONFIG},
     error::{RtError, RtResult},
     venv::{venv_path, venv_python_path},
 };
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct RuntimeConfig {
+    rt_version: String,
+    #[serde(rename = "project_root")]
+    _project_root: String,
+    #[serde(rename = "no_editable")]
+    _no_editable: bool,
+    #[serde(rename = "environment")]
+    _environment: std::collections::HashMap<String, String>,
+    #[serde(rename = "services")]
+    _services: Vec<String>,
+    command: serde_json::Value,
+}
 
 /// Report whether an execution-context environment was completely built by
 /// this version of rt.
@@ -26,23 +41,28 @@ pub fn run(riot_root: &Path, hash: &str) -> RtResult<()> {
 
 fn is_ready(riot_root: &Path, hash: &str) -> bool {
     let environment_path = venv_path(riot_root, hash);
-    let marker_is_current = fs::read_to_string(environment_path.join(DONE_MARKER))
-        .is_ok_and(|contents| contents.trim() == RT_VERSION);
+    let manifest_is_current = fs::read_to_string(environment_path.join(RUNTIME_CONFIG))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<RuntimeConfig>(&contents).ok())
+        .is_some_and(|manifest| {
+            manifest.rt_version == RT_VERSION
+                && (manifest.command.is_null() || manifest.command.is_string())
+        });
 
-    marker_is_current && Path::new(&venv_python_path(riot_root, hash)).is_file()
+    manifest_is_current && Path::new(&venv_python_path(riot_root, hash)).is_file()
 }
 
 #[cfg(test)]
 mod tests {
     use super::is_ready;
     use crate::{
-        constants::{DONE_MARKER, RT_VERSION},
+        constants::{RT_VERSION, RUNTIME_CONFIG},
         venv::venv_path,
     };
     use std::fs;
 
     #[test]
-    fn readiness_requires_python_and_a_current_completion_marker() {
+    fn readiness_requires_python_and_a_current_runtime_manifest() {
         let root = tempfile::tempdir().unwrap();
         let hash = "abc1234@def5678";
         let environment = venv_path(root.path(), hash);
@@ -53,10 +73,33 @@ mod tests {
         fs::write(environment.join("bin/python"), "").unwrap();
         assert!(!is_ready(root.path(), hash));
 
-        fs::write(environment.join(DONE_MARKER), "an-older-version\n").unwrap();
+        fs::write(environment.join(RUNTIME_CONFIG), "not json\n").unwrap();
         assert!(!is_ready(root.path(), hash));
 
-        fs::write(environment.join(DONE_MARKER), format!("{RT_VERSION}\n")).unwrap();
+        fs::write(
+            environment.join(RUNTIME_CONFIG),
+            "{\"rt_version\":\"an-older-version\"}\n",
+        )
+        .unwrap();
+        assert!(!is_ready(root.path(), hash));
+
+        fs::write(
+            environment.join(RUNTIME_CONFIG),
+            format!(
+                concat!(
+                    "{{",
+                    "\"rt_version\":\"{}\",",
+                    "\"project_root\":\"/project\",",
+                    "\"no_editable\":false,",
+                    "\"environment\":{{}},",
+                    "\"services\":[],",
+                    "\"command\":null",
+                    "}}\n"
+                ),
+                RT_VERSION
+            ),
+        )
+        .unwrap();
         assert!(is_ready(root.path(), hash));
     }
 }

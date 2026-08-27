@@ -13,11 +13,13 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Iterable, Sequence
 from contextlib import suppress
-from sitecustomize import context as _RT_CONTEXT
 from time import sleep
-from typing import Iterable, Sequence
 
+from _rt_runtime import get_context
+
+_RT_CONTEXT = get_context()
 _PROJECT_ROOT = _RT_CONTEXT["project_root"]
 _SERVICES = _RT_CONTEXT["services"]
 _ORIGINAL_COMMAND = _RT_CONTEXT["command"]
@@ -70,7 +72,9 @@ def _start_services(project_root: str, services: Sequence[str]) -> None:
     # random one, same fallback as scripts/run-tests.
     print("=== port conflict, retrying testagent on a random port ===")
     os.environ["TESTAGENT_HOST_PORT"] = "0"
-    subprocess.run(_compose_command(project_root, "up", "-d", *services), cwd=project_root)
+    subprocess.run(
+        _compose_command(project_root, "up", "-d", *services), cwd=project_root
+    )
 
 
 def _testagent_url(project_root: str) -> str:

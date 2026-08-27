@@ -1,0 +1,21 @@
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "rt-runtime"
+version = "1.4.0"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["vendor/types-envier/LICENSE"]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/**/*.py" },
+    { file = "purelib/**" },
+]
+
+[tool.uv.build-backend]
+module-name = "_rt_runtime"
+data = { purelib = "purelib" }
