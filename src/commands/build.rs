@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fmt::Write as FmtWrite,
     fs,
     io::{self, IsTerminal},
@@ -91,8 +90,6 @@ pub fn build_selected_contexts(
     let shared = Arc::new(BuildSharedState::new(
         force_reinstall,
         no_editable,
-        Arc::clone(&repo.build_env),
-        Arc::clone(&repo.run_env),
         repo.riot_root.clone(),
         repo.riotfile_path
             .parent()
@@ -134,8 +131,6 @@ type DynResult<T> = RtResult<T>;
 pub struct BuildSharedState {
     force_reinstall: bool,
     no_editable: bool,
-    build_env: Arc<HashMap<String, String>>,
-    run_env: Arc<HashMap<String, String>>,
     riot_root: PathBuf,
     project_root: PathBuf,
 }
@@ -145,16 +140,12 @@ impl BuildSharedState {
     pub const fn new(
         force_reinstall: bool,
         no_editable: bool,
-        build_env: Arc<HashMap<String, String>>,
-        run_env: Arc<HashMap<String, String>>,
         riot_root: PathBuf,
         project_root: PathBuf,
     ) -> Self {
         Self {
             force_reinstall,
             no_editable,
-            build_env,
-            run_env,
             riot_root,
             project_root,
         }
@@ -180,7 +171,7 @@ impl BuildSharedState {
         // pylibmc has no wheels: it compiles against libmemcached, which the CI
         // image installs system-wide (libmemcached-dev). On developer machines
         // the headers usually live under a Homebrew prefix, so point the build
-        // at it. Applied before build_env so rt.toml can still override it.
+        // at it.
         if has_pkg(venv, "pylibmc")
             && let Some(prefix) = libmemcached_prefix()
         {
@@ -188,7 +179,6 @@ impl BuildSharedState {
         }
 
         cmd = cmd
-            .envs(self.build_env.as_ref())
             .env("DD_FAST_BUILD", "1")
             .env("UV_PROJECT_ENVIRONMENT", &exc_venv_path)
             .arg("--project")
@@ -310,14 +300,6 @@ impl BuildSharedState {
         if !exc.env.is_empty() {
             sc.push_str("\n# Environment variables from riotfile.py\n");
             for (key, val) in &exc.env {
-                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
-            }
-        }
-
-        // environment variables from rt.toml
-        if !self.run_env.is_empty() {
-            sc.push_str("\n# Environment variables from rt.toml\n");
-            for (key, val) in self.run_env.iter() {
                 writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
             }
         }

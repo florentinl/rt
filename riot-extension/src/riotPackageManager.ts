@@ -104,7 +104,6 @@ export class RiotPackageManager implements PackageManager {
     const requirementsDirectory = path.join(riotRoot, "requirements");
     return [
       new vscode.RelativePattern(declarationRoot, "riotfile.py"),
-      new vscode.RelativePattern(declarationRoot, "rt.toml"),
       new vscode.RelativePattern(requirementsDirectory, `${record.venv.hash}.txt`),
     ];
   }

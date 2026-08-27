@@ -106,7 +106,6 @@ fn execute_command(
 
     let status = ManagedCommand::new_uv("run", Arc::clone(&ctx.sink), ctx.step_id.clone())
         .envs(&exc_ctx.env)
-        .envs(repo.run_env.as_ref())
         .arg("--no-project")
         .args([
             "--python",

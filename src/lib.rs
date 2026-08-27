@@ -21,7 +21,7 @@ mod uv_project;
 mod venv;
 
 use crate::{
-    config::{RepoConfig, RunConfig, Selector, load_rt_toml},
+    config::{RepoConfig, RunConfig, Selector},
     error::{RtError, RtResult},
     venv::{RiotVenv, load_context},
 };
@@ -411,8 +411,7 @@ fn try_main(args: Vec<String>) -> RtResult<()> {
 
     let riot_venvs = load_context_with_default_provider(&riotfile_path, Some(&riot_root))?;
 
-    let (build_env, run_env) = load_rt_toml(&riotfile_path)?;
-    let repo_config = RepoConfig::load(riotfile_path, riot_root, build_env, run_env);
+    let repo_config = RepoConfig::new(riotfile_path, riot_root);
 
     run_command(riot_venvs, cli, &repo_config)
 }

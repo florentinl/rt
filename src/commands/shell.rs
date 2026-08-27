@@ -114,8 +114,6 @@ fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {
         command.env(key, value);
     }
 
-    command.envs(repo.run_env.iter());
-
     let status = command.status().map_err(|err| {
         RtError::message(format!(
             "error: failed to spawn shell for {}: {err}",
