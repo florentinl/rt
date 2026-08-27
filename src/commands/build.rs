@@ -1,5 +1,4 @@
 use std::{
-    fmt::Write as FmtWrite,
     fs,
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -19,6 +18,7 @@ use crate::{
     venv::{ExecutionContext, RiotVenv, venv_path},
 };
 use indexmap::IndexMap;
+use serde::Serialize;
 
 use rayon::current_num_threads;
 
@@ -27,6 +27,8 @@ use crate::{
     constants::{DONE_MARKER, RT_VERSION},
     venv::select_execution_contexts,
 };
+
+const CONTEXT_MANIFEST: &str = "rt_context.json";
 
 /// Build the virtual environment for the provided execution context.
 ///
@@ -41,8 +43,7 @@ pub fn run(
     no_editable: bool,
 ) -> RtResult<()> {
     let selected = select_execution_contexts(venvs, selector)?;
-    build_selected_contexts(repo, &selected, force_reinstall, no_editable)?;
-    Ok(())
+    build_selected_contexts(repo, &selected, force_reinstall, no_editable)
 }
 
 #[must_use]
@@ -71,14 +72,8 @@ pub fn build_selected_contexts(
     force_reinstall: bool,
     no_editable: bool,
 ) -> RtResult<()> {
-    if let Err(e) = fs::DirBuilder::new()
-        .recursive(true)
-        .create(&repo.riot_root)
-    {
-        return Err(RtError::message(format!(
-            "error: could not create riot root: {e}"
-        )));
-    }
+    fs::create_dir_all(&repo.riot_root)
+        .map_err(|err| RtError::message(format!("error: could not create riot root: {err}")))?;
     let sink: Arc<dyn ProgressLogger> = if io::stderr().is_terminal() {
         match MultiplexedProgressLogger::new() {
             Ok(logger) => Arc::new(logger),
@@ -126,9 +121,7 @@ pub fn build_selected_contexts(
     Ok(())
 }
 
-type DynResult<T> = RtResult<T>;
-
-pub struct BuildSharedState {
+struct BuildSharedState {
     force_reinstall: bool,
     no_editable: bool,
     riot_root: PathBuf,
@@ -137,7 +130,7 @@ pub struct BuildSharedState {
 
 impl BuildSharedState {
     #[must_use]
-    pub const fn new(
+    const fn new(
         force_reinstall: bool,
         no_editable: bool,
         riot_root: PathBuf,
@@ -156,10 +149,8 @@ impl BuildSharedState {
         venv: &RiotVenv,
         exc: &ExecutionContext,
         ctx: &StepContext,
-    ) -> DynResult<StepOutcome> {
+    ) -> RtResult<StepOutcome> {
         let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
-        let marker_path = exc_venv_path.join(DONE_MARKER);
-
         if self.force_reinstall && exc_venv_path.exists() {
             fs::remove_dir_all(&exc_venv_path)?;
         }
@@ -205,11 +196,11 @@ impl BuildSharedState {
         }
 
         let site_packages_path =
-            exc_venv_path.join(format!("lib/python{}/site-packages", &venv.python));
+            exc_venv_path.join(format!("lib/python{}/site-packages", venv.python));
 
         self.configure_site_packages(venv, exc, &site_packages_path)?;
 
-        write_marker(&marker_path)?;
+        fs::write(exc_venv_path.join(DONE_MARKER), format!("{RT_VERSION}\n"))?;
 
         Ok(StepOutcome::Done)
     }
@@ -222,20 +213,13 @@ impl BuildSharedState {
     ) -> RtResult<()> {
         fs::create_dir_all(site_packages_path)?;
 
-        let current_dir =
+        let project_root =
             fs::canonicalize(&self.project_root).unwrap_or_else(|_| self.project_root.clone());
 
-        {
-            fs::write(
-                site_packages_path.join("pytest_rt.py"),
-                include_str!("../../pytest_rt/pytest_rt.py"),
-            )?;
-            fs::write(
-                site_packages_path.join("enable_pytest_rt.py"),
-                include_str!("../../pytest_rt/enable_pytest_rt.py"),
-            )?;
-        }
-
+        fs::write(
+            site_packages_path.join("pytest_rt.py"),
+            include_str!("../../pytest_rt/pytest_rt.py"),
+        )?;
         // envier is a ddtrace runtime dependency, so it lands in the venv
         // through the local project dependency rather than through a riotfile
         // package. A context that skips the project only has it when the
@@ -244,9 +228,9 @@ impl BuildSharedState {
             write_envier_stubs(site_packages_path)?;
         }
 
-        self.write_sitecustomize(
+        self.write_runtime_context(
             site_packages_path,
-            &current_dir,
+            &project_root,
             exc,
             &venv.services,
             &venv.suite_env,
@@ -255,94 +239,49 @@ impl BuildSharedState {
         Ok(())
     }
 
-    fn write_sitecustomize(
+    fn write_runtime_context(
         &self,
         site_packages_path: &Path,
-        current_dir: &Path,
+        project_root: &Path,
         exc: &ExecutionContext,
         services: &[String],
         suite_env: &IndexMap<String, String>,
     ) -> RtResult<()> {
-        let sitecustomize_path = site_packages_path.join("sitecustomize.py");
-        let mut sc = String::new();
-        sc.push_str("import os\n");
+        let mut environment = suite_env.clone();
 
-        if self.no_editable {
-            // In non-editable mode the installed package must take precedence
-            // over the local source tree.  Python puts '' (CWD) at sys.path[0]
-            // which would shadow the installed copy.  We remove both '' and the
-            // absolute project root, then re-append the project root at the end
-            // so test helpers remain importable but lose priority.
-            let project_root_str = current_dir.to_string_lossy();
-            writeln!(sc, "\nimport sys")?;
-            writeln!(
-                sc,
-                "sys.path[:] = [p for p in sys.path if p not in ('', r\"{project_root_str}\")]"
-            )?;
-            writeln!(
-                sc,
-                "sys.path.append(r\"{project_root_str}\")  # test helpers still importable, but last"
-            )?;
-        }
+        // Values from riotfile.py override inherited suitespec values.
+        environment.extend(exc.env.clone());
 
-        // environment variables from tests/suitespec.yml, exported by
-        // scripts/run-tests before it hands over to riot. riotfile.py env vars
-        // are applied after these so they keep winning, exactly like riot
-        // overriding the inherited process environment.
-        if !suite_env.is_empty() {
-            sc.push_str("\n# Environment variables from tests/suitespec.yml\n");
-            for (key, val) in suite_env {
-                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
-            }
-        }
+        let project_root = project_root.to_string_lossy().into_owned();
+        let manifest = RuntimeContextManifest {
+            project_root: &project_root,
+            no_editable: self.no_editable,
+            environment,
+            services,
+            command: exc.command.as_deref(),
+        };
+        let mut manifest = serde_json::to_string_pretty(&manifest).map_err(|err| {
+            RtError::message(format!("error: failed to serialize runtime context: {err}"))
+        })?;
+        manifest.push('\n');
 
-        // environment variables from riotfile.py
-        if !exc.env.is_empty() {
-            sc.push_str("\n# Environment variables from riotfile.py\n");
-            for (key, val) in &exc.env {
-                writeln!(sc, "os.environ[r\"{key}\"] = r\"{val}\"")?;
-            }
-        }
-
-        writeln!(sc)?;
-        writeln!(
-            sc,
-            "# Pytest hacks for dd-trace-py using a pytest plugin that starts/stops suitespec services, trims python versions (ex: [3.13]) from test names and resets datadog service name based on the original riotfile command"
+        fs::write(site_packages_path.join(CONTEXT_MANIFEST), manifest)?;
+        fs::write(
+            site_packages_path.join("sitecustomize.py"),
+            include_str!("../../pytest_rt/sitecustomize.py"),
         )?;
-        writeln!(sc, "import enable_pytest_rt")?;
 
-        let services_csv = services.join(",");
-        let project_root = current_dir.to_string_lossy();
-
-        writeln!(
-            sc,
-            "os.environ[\"PYTHONPATH\"] = r\"{project_root}\" # Functionally useless but some tests assume that this env var is not empty..."
-        )?;
-        if services.iter().any(|svc| svc == "testagent") {
-            writeln!(
-                sc,
-                "os.environ[\"DD_TRACE_AGENT_URL\"] = \"http://localhost:9126\" # default testagent url; pytest_rt refines it from the published compose port"
-            )?;
-        }
-
-        writeln!(
-            sc,
-            "os.environ[\"RIOT_SUITESPEC_SERVICES\"] = r\"{services_csv}\" # store services to start for pytest_rt plugin"
-        )?;
-        writeln!(
-            sc,
-            "os.environ[\"RIOT_PROJECT_ROOT\"] = r\"{project_root}\" # store riot project root for pytest_rt plugin"
-        )?;
-        if let Some(command) = exc.command.as_ref() {
-            writeln!(
-                sc,
-                "os.environ[\"RIOT_ORIGINAL_COMMAND\"] = r\"{command}\" # store riotfile.py command for pytest_rt plugin"
-            )?;
-        }
-
-        fs::write(sitecustomize_path, sc)?;
         Ok(())
     }
+}
+
+#[derive(Serialize)]
+struct RuntimeContextManifest<'a> {
+    project_root: &'a str,
+    no_editable: bool,
+    environment: IndexMap<String, String>,
+    services: &'a [String],
+    command: Option<&'a str>,
 }
 
 /// Vendored `types-envier` stub package, embedded at compile time.
@@ -382,10 +321,6 @@ fn write_envier_stubs(site_packages_path: &Path) -> RtResult<()> {
     }
 
     Ok(())
-}
-
-fn write_marker(marker_path: &Path) -> io::Result<()> {
-    fs::write(marker_path, format!("{RT_VERSION}\n"))
 }
 
 /// Locate a libmemcached installation for building `pylibmc`.
@@ -438,8 +373,9 @@ fn brew_prefix(formula: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENVIER_STUBS, write_envier_stubs, write_marker};
-    use crate::constants::{DONE_MARKER, RT_VERSION};
+    use super::{BuildSharedState, CONTEXT_MANIFEST, ENVIER_STUBS, write_envier_stubs};
+    use crate::venv::{ExecutionContext, RiotVenv};
+    use indexmap::IndexMap;
     use std::fs;
 
     #[test]
@@ -475,12 +411,58 @@ mod tests {
     }
 
     #[test]
-    fn marker_records_the_rt_version() {
+    fn runtime_context_uses_static_python_files_and_a_json_manifest() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(DONE_MARKER);
+        let project_root = dir.path().join("project");
+        let site_packages = dir.path().join("site-packages");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+        let state =
+            BuildSharedState::new(false, true, dir.path().join(".riot"), project_root.clone());
+        let mut venv = RiotVenv::empty_for_tests();
+        venv.services = vec!["postgres".to_owned(), "testagent".to_owned()];
+        venv.suite_env
+            .insert("SHARED".to_owned(), "suite".to_owned());
+        venv.suite_env
+            .insert("SUITE_ONLY".to_owned(), "line\nvalue".to_owned());
+        let exc = ExecutionContext {
+            command: Some("pytest tests/example.py".to_owned()),
+            pytest_targets: Vec::new(),
+            env: IndexMap::from([
+                ("SHARED".to_owned(), "riotfile".to_owned()),
+                ("RIOT_ONLY".to_owned(), "quoted \"value\"".to_owned()),
+            ]),
+            create: true,
+            skip_dev_install: true,
+            hash: "context".to_owned(),
+        };
 
-        write_marker(&marker).unwrap();
+        state
+            .configure_site_packages(&venv, &exc, &site_packages)
+            .unwrap();
 
-        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), RT_VERSION);
+        assert_eq!(
+            fs::read_to_string(site_packages.join("sitecustomize.py")).unwrap(),
+            include_str!("../../pytest_rt/sitecustomize.py")
+        );
+        assert_eq!(
+            fs::read_to_string(site_packages.join("pytest_rt.py")).unwrap(),
+            include_str!("../../pytest_rt/pytest_rt.py")
+        );
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(site_packages.join(CONTEXT_MANIFEST)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["project_root"].as_str(),
+            project_root.canonicalize().unwrap().to_str()
+        );
+        assert_eq!(manifest["no_editable"].as_bool(), Some(true));
+        assert_eq!(manifest["environment"]["SHARED"], "riotfile");
+        assert_eq!(manifest["environment"]["SUITE_ONLY"], "line\nvalue");
+        assert_eq!(manifest["environment"]["RIOT_ONLY"], "quoted \"value\"");
+        assert_eq!(manifest["services"][0], "postgres");
+        assert_eq!(manifest["services"][1], "testagent");
+        assert_eq!(manifest["command"], "pytest tests/example.py");
     }
 }

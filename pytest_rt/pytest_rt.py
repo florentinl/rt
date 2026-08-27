@@ -8,19 +8,19 @@ It has three functions:
 - restore the datadog service, as if it was parsed from the command in the riotfile.py
 """
 
-from time import sleep
-
-import contextlib
-
 import hashlib
-import subprocess
-
-import sys
 import os
 import shlex
-from typing import Iterable, List, Sequence
+import subprocess
+import sys
 from contextlib import suppress
+from sitecustomize import context as _RT_CONTEXT
+from time import sleep
+from typing import Iterable, Sequence
 
+_PROJECT_ROOT = _RT_CONTEXT["project_root"]
+_SERVICES = _RT_CONTEXT["services"]
+_ORIGINAL_COMMAND = _RT_CONTEXT["command"]
 _PY_TAG = f"py{sys.version_info.major}.{sys.version_info.minor}"
 _PY_SUFFIX = f"[{_PY_TAG}]"
 
@@ -47,7 +47,7 @@ def _ensure_compose_project_name(project_root: str) -> None:
     os.environ["COMPOSE_PROJECT_NAME"] = f"ddtracepy-{path_hash}"
 
 
-def _compose_command(project_root: str, *args: str) -> List[str]:
+def _compose_command(project_root: str, *args: str) -> list[str]:
     cmd = ["docker", "compose"]
     if _podman_compat():
         cmd += ["-f", os.path.join(project_root, "docker-compose.base.yml")]
@@ -58,20 +58,19 @@ def _compose_command(project_root: str, *args: str) -> List[str]:
     return cmd
 
 
-def _start_services(project_root: str, services: Sequence[str]) -> bool:
+def _start_services(project_root: str, services: Sequence[str]) -> None:
     cmd = _compose_command(project_root, "up", "-d", *services)
     if subprocess.run(cmd, cwd=project_root).returncode == 0:
-        return True
+        return
 
     if "testagent" not in services or _podman_compat():
-        return False
+        return
 
     # Another checkout already claimed the default testagent port: retry on a
     # random one, same fallback as scripts/run-tests.
     print("=== port conflict, retrying testagent on a random port ===")
     os.environ["TESTAGENT_HOST_PORT"] = "0"
-    cmd = _compose_command(project_root, "up", "-d", *services)
-    return subprocess.run(cmd, cwd=project_root).returncode == 0
+    subprocess.run(_compose_command(project_root, "up", "-d", *services), cwd=project_root)
 
 
 def _testagent_url(project_root: str) -> str:
@@ -100,13 +99,12 @@ def _stop_services(project_root: str, services: Sequence[str]) -> None:
     args = ("down",) if _podman_compat() else ("down", *services)
     subprocess.run(_compose_command(project_root, *args), cwd=project_root)
 
+
 with suppress(Exception):
     import pytest
 
     def _strip_suffix(value: str) -> str:
-        if value.endswith(_PY_SUFFIX):
-            return value[: -len(_PY_SUFFIX)]
-        return value
+        return value.removesuffix(_PY_SUFFIX)
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(
@@ -132,25 +130,21 @@ with suppress(Exception):
     def pytest_sessionstart(session):
         if not _is_entrypoint():
             return
-        suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
-        if suitespec_services != "" and _should_manage_services(session):
+        if _SERVICES and _should_manage_services(session):
             print("=== starting services ===")
-            project_root = os.getenv("RIOT_PROJECT_ROOT", "")
-            _ensure_compose_project_name(project_root)
-            services = suitespec_services.split(",")
-            _start_services(project_root, services)
-            if "testagent" in services:
-                url = _testagent_url(project_root)
+            _ensure_compose_project_name(_PROJECT_ROOT)
+            _start_services(_PROJECT_ROOT, _SERVICES)
+            if "testagent" in _SERVICES:
+                url = _testagent_url(_PROJECT_ROOT)
                 os.environ["DD_TRACE_AGENT_URL"] = url
                 print(f"=== testagent at {url} ===")
             sleep(5)  # Wait a bit for services (postgresql mainly) to be ready
 
         # Restore service name (otherwise it can be overriden to something like `vscode_pytest`)
-        with contextlib.suppress(Exception):
-            command_line = os.getenv("RIOT_ORIGINAL_COMMAND")
-            if not command_line:
+        with suppress(Exception):
+            if not _ORIGINAL_COMMAND:
                 return
-            argv = shlex.split(command_line)
+            argv = shlex.split(_ORIGINAL_COMMAND)
 
             from ddtrace.internal.settings._inferred_base_service import detect_service
             from ddtrace.internal.schema.processor import BaseServiceProcessor
@@ -169,12 +163,9 @@ with suppress(Exception):
     def pytest_sessionfinish(session, exitstatus):
         if not _is_entrypoint():
             return
-        suitespec_services = os.getenv("RIOT_SUITESPEC_SERVICES", "")
-        if suitespec_services == "" or not _should_manage_services(session):
+        if not _SERVICES or not _should_manage_services(session):
             return
-        project_root = os.getenv("RIOT_PROJECT_ROOT", "")
-        _ensure_compose_project_name(project_root)
-        services = suitespec_services.split(",")
+        _ensure_compose_project_name(_PROJECT_ROOT)
 
         print("=== stopping services ===")
-        _stop_services(project_root, services)
+        _stop_services(_PROJECT_ROOT, _SERVICES)
