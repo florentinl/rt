@@ -312,16 +312,27 @@ export class SuitespecEnvManager implements EnvironmentManager {
     environment: RtTestEnvironment,
     run: RtTestRun,
   ): string {
+    const differingEnv = run.differing_env &&
+      Object.fromEntries(
+        Object.entries(run.differing_env).map(([key, value]) => [
+          key,
+          value ?? "<inherited>",
+        ]),
+      );
     return [
       `Suite: ${suite.id}`,
-      `Dependency environment: ${environment.name} (${environment.hash})`,
-      `Python: ${environment.python}`,
-      `Run: ${run.index + 1} (${run.id})`,
+      `Dependency environment: ${environment.display_name ?? `${environment.name} · Python ${environment.python}`} (${environment.hash})`,
+      `Selector: ${run.id}`,
       environment.direct_dependencies.length
         ? `Direct dependencies: ${environment.direct_dependencies.join(", ")}`
         : "Direct dependencies: none",
+      `Command: ${run.command}`,
       `Lockfile: ${environment.lockfile}`,
-      Object.keys(run.env).length ? `Run environment: ${formatRecord(run.env)}` : undefined,
+      differingEnv && Object.keys(differingEnv).length
+        ? `Differing run environment: ${formatRecord(differingEnv)}`
+        : run.differing_env === undefined && Object.keys(run.env).length
+          ? `Run environment: ${formatRecord(run.env)}`
+          : undefined,
       `Profile: ${run.profile_path}`,
     ]
       .filter((line): line is string => line !== undefined)

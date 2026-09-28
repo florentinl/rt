@@ -18,6 +18,8 @@ export interface RtSuite {
 export interface RtTestEnvironment {
   readonly hash: string;
   readonly name: string;
+  /** Added to the version 1 index after the initial suitespec release. */
+  readonly display_name?: string;
   readonly integration_name: string;
   readonly python: string;
   readonly direct_dependencies: string[];
@@ -37,6 +39,8 @@ export interface RtTestRun {
   readonly index: number;
   readonly command: string;
   readonly env: Record<string, string>;
+  /** Variables whose values or presence differ between sibling runs. */
+  readonly differing_env?: Record<string, string | null>;
   /** Authoritative pytest arguments from the suitespec command, without `{cmdargs}`. */
   readonly pytest_args: string[];
   readonly pytest_targets: string[];

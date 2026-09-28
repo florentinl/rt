@@ -66,6 +66,7 @@ function makeEnvironment(
     python_path: "/workspace/.cache/rt/environments/1234567/bin/python",
     activate_path: "/workspace/.cache/rt/environments/1234567/bin/activate",
     name: "test",
+    display_name: "test · Python 3.13",
     integration_name: "test",
     python: "3.13",
     direct_dependencies: [],

@@ -14,6 +14,7 @@ mod config;
 mod constants;
 mod display;
 mod error;
+mod presentation;
 mod progress;
 mod suitespec;
 mod ui;

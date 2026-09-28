@@ -67,6 +67,10 @@ suite("rt suite extension", () => {
       suite.id,
     );
     assert.match(String(first.tooltip), /Direct dependencies: pytest>=8/);
+    assert.match(String(first.tooltip), /Command: pytest tests\/unit\/test_0\.py/);
+    assert.match(String(first.tooltip), /Differing run environment: RUN_INDEX=0/);
+    assert.doesNotMatch(String(first.tooltip), /SHARED/);
+    assert.doesNotMatch(String(first.tooltip), /Run: 1/);
     assert.match(String(first.tooltip), /Profile:/);
   });
 });
@@ -75,6 +79,7 @@ function makeSuite(): RtSuite {
   const environment: RtTestEnvironment = {
     hash: "abc1234",
     name: "unit-py313",
+    display_name: "unit-py313 · Python 3.13",
     integration_name: "unit",
     python: "3.13",
     direct_dependencies: ["pytest>=8"],
@@ -103,13 +108,14 @@ function makeRun(index: number): RtTestRun {
     id: `abc1234@${index}`,
     index,
     command: `pytest tests/unit/test_${index}.py`,
-    env: { RUN_INDEX: String(index) },
+    env: { SHARED: "fixed", RUN_INDEX: String(index) },
+    differing_env: { RUN_INDEX: String(index) },
     pytest_args: [`tests/unit/test_${index}.py`],
     profile_fingerprint: `fingerprint-${index}`,
     pytest_targets: [`tests/unit/test_${index}.py`],
     profile_path: `${base}/profile.json`,
-    display_name: `unit-py313 (run ${index + 1})`,
-    short_display_name: `unit ${index + 1}`,
+    display_name: `unit-py313 · Python 3.13 · RUN_INDEX=${index}`,
+    short_display_name: `unit-py313 (3.13) · RUN_INDEX=${index}`,
     venv_path: base,
     python_path: `${base}/bin/python`,
     activate_path: `${base}/bin/activate`,
