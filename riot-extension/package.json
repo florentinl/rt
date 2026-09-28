@@ -1,8 +1,8 @@
 {
   "name": "riot-python-environments",
   "publisher": "florentinl",
-  "displayName": "Riot Python Environments",
-  "description": "Python Environments extension plugin for Datadog's Riot venv manager",
+  "displayName": "rt Suite Environments",
+  "description": "Suitespec-native Python test environments powered by rt",
   "version": "1.5.0",
   "repository": "https://github.com/florentinl/rt.git",
   "engines": {
@@ -12,7 +12,8 @@
     "Other"
   ],
   "activationEvents": [
-    "workspaceContains:**/riotfile.py"
+    "workspaceContains:**/suitespec.yml",
+    "workspaceContains:scripts/run-tests"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -20,17 +21,17 @@
       {
         "command": "riot.forceReinstallEnvironment",
         "title": "Force Reinstall Selected Environment",
-        "category": "Riot"
+        "category": "rt"
       },
       {
         "command": "riot.refreshVenvIndicators",
-        "title": "Refresh Riot Venv Indicators",
-        "category": "Riot"
+        "title": "Refresh Suite Indicators",
+        "category": "rt"
       },
       {
         "command": "riot.selectActiveFileVenv",
-        "title": "Select Riot Environment for Current File",
-        "category": "Riot"
+        "title": "Select Suite Environment for Current File",
+        "category": "rt"
       }
     ]
   },
@@ -44,7 +45,7 @@
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "npm run check-types && npm run lint && node esbuild.js --production",
     "compile-tests": "tsc -p . --outDir out",
-    "test:unit": "npm run compile-tests && node --test out/test/packageMetadata.test.js out/test/pytestTargets.test.js",
+    "test:unit": "npm run compile-tests && node --test out/test/packageMetadata.test.js out/test/suitePatterns.test.js out/test/testingConfigManager.test.js",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",

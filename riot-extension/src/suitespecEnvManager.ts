@@ -1,8 +1,3 @@
-/**
- * Riot Environment Manager
- * Coordinates environment discovery, management, and lifecycle.
- */
-
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
@@ -10,6 +5,7 @@ import {
   DidChangeEnvironmentEventArgs,
   DidChangeEnvironmentsEventArgs,
   EnvironmentChangeKind,
+  EnvironmentGroupInfo,
   EnvironmentManager,
   GetEnvironmentScope,
   GetEnvironmentsScope,
@@ -23,30 +19,34 @@ import {
 import { RtCliService } from "./services/rtCliService";
 import { TestingConfigurationManager } from "./services/testingConfigManager";
 import { WorkspaceResolver } from "./services/workspaceResolver";
-import { buildManagerId, RtExecutionContext, RtVenv } from "./types/rtTypes";
+import {
+  buildManagerId,
+  RtSuite,
+  RtTestEnvironment,
+  RtTestRun,
+} from "./types/rtTypes";
 
-export { RtExecutionContext, RtVenv } from "./types/rtTypes";
-
-export interface RiotEnvironmentRecord {
+export interface SuitespecEnvironmentRecord {
   readonly workspaceRoot: string;
-  readonly venv: RtVenv;
-  readonly context: RtExecutionContext;
+  readonly suite: RtSuite;
+  readonly testEnvironment: RtTestEnvironment;
+  readonly run: RtTestRun;
   readonly environment: PythonEnvironment;
 }
 
 interface WorkspaceSnapshot {
-  readonly venvs: RtVenv[];
+  readonly suites: RtSuite[];
   readonly environments: PythonEnvironment[];
-  readonly recordsById: Map<string, RiotEnvironmentRecord>;
-  readonly recordsByHash: Map<string, RiotEnvironmentRecord>;
+  readonly recordsById: Map<string, SuitespecEnvironmentRecord>;
+  readonly recordsByRunId: Map<string, SuitespecEnvironmentRecord>;
 }
 
-/** Main environment manager implementation. */
-export class RiotEnvManager implements EnvironmentManager {
-  readonly name = "riot";
-  readonly displayName = "Riot";
-  readonly description = "Immutable environments declared in riotfile.py";
-  readonly tooltip = "Riot virtual environments";
+/** Exposes suitespec test runs through VS Code's native Python Environments API. */
+export class SuitespecEnvManager implements EnvironmentManager {
+  readonly name = "rt";
+  readonly displayName = "rt suites";
+  readonly description = "Immutable Python test environments declared by suitespec";
+  readonly tooltip = "Suitespec test environments managed by rt";
   readonly iconPath?: IconPath;
   readonly log: vscode.LogOutputChannel;
   readonly managerId: string;
@@ -59,7 +59,6 @@ export class RiotEnvManager implements EnvironmentManager {
   private readonly snapshots = new Map<string, WorkspaceSnapshot>();
   private readonly ongoingLoads = new Map<string, Promise<WorkspaceSnapshot>>();
   private readonly ongoingActivations = new Map<string, AbortController>();
-
   private readonly envsEmitter =
     new vscode.EventEmitter<DidChangeEnvironmentsEventArgs>();
   private readonly envEmitter =
@@ -74,7 +73,7 @@ export class RiotEnvManager implements EnvironmentManager {
     extensionPath?: string,
   ) {
     this.managerId = buildManagerId(extensionId, this.name);
-    this.preferredPackageManagerId = buildManagerId(extensionId, "rt");
+    this.preferredPackageManagerId = buildManagerId(extensionId, "rt-packages");
     this.log = log;
     this.cliService = new RtCliService(log, extensionPath);
     this.testingConfigManager = new TestingConfigurationManager(log);
@@ -83,29 +82,24 @@ export class RiotEnvManager implements EnvironmentManager {
   async refresh(scope: RefreshEnvironmentsScope): Promise<void> {
     const folders = this.workspaceResolver.getWorkspaceFoldersForScope(scope);
     const changes: DidChangeEnvironmentsEventArgs = [];
-
     await Promise.all(
       folders.map(async (folder) => {
         const cwd = folder.fsPath;
         const previous = this.snapshots.get(cwd)?.environments ?? [];
-        const nextSnapshot = await this.loadWorkspace(cwd, true);
-        changes.push(...this.computeChanges(previous, nextSnapshot.environments));
-        await this.reconcileCurrentEnvironment(folder, nextSnapshot);
+        const next = await this.loadWorkspace(cwd, true);
+        changes.push(...this.computeChanges(previous, next.environments));
+        await this.reconcileCurrentEnvironment(folder, next);
       }),
     );
-
     if (changes.length > 0) {
       this.envsEmitter.fire(changes);
     }
   }
 
-  async getEnvironments(
-    scope: GetEnvironmentsScope,
-  ): Promise<PythonEnvironment[]> {
+  async getEnvironments(scope: GetEnvironmentsScope): Promise<PythonEnvironment[]> {
     if (scope === "global") {
       return [];
     }
-
     const folders = this.workspaceResolver.getWorkspaceFoldersForScope(scope);
     const snapshots = await Promise.all(
       folders.map((folder) => this.loadWorkspace(folder.fsPath, false)),
@@ -124,17 +118,15 @@ export class RiotEnvManager implements EnvironmentManager {
     if (folders.length === 0) {
       if (environment) {
         void vscode.window.showErrorMessage(
-          "Unable to determine workspace folder. Open a file in the target workspace and try again.",
+          "Unable to determine the workspace folder for this suite environment.",
         );
       }
       return;
     }
-
     for (const folder of folders) {
       const cwd = folder.fsPath;
       const previous = this.currentEnvironment.get(cwd);
       this.cancelActivation(cwd);
-
       if (environment) {
         await this.activateEnvironment(cwd, folder, environment, previous);
       } else {
@@ -143,19 +135,15 @@ export class RiotEnvManager implements EnvironmentManager {
     }
   }
 
-  async get(
-    scope: GetEnvironmentScope,
-  ): Promise<PythonEnvironment | undefined> {
+  async get(scope: GetEnvironmentScope): Promise<PythonEnvironment | undefined> {
     const folder = this.workspaceResolver.getWorkspaceFolder(scope);
     if (!folder) {
       return undefined;
     }
-
     const current = this.currentEnvironment.get(folder.fsPath);
     if (current && this.environmentExecutableExists(current)) {
       return current;
     }
-
     this.currentEnvironment.delete(folder.fsPath);
     return undefined;
   }
@@ -163,17 +151,11 @@ export class RiotEnvManager implements EnvironmentManager {
   async resolve(
     context: ResolveEnvironmentContext,
   ): Promise<PythonEnvironment | undefined> {
-    const scopedFolder = this.workspaceResolver.getWorkspaceFolder(context);
-    const allFolders = this.workspaceResolver.getWorkspaceFolders();
-    const folders = scopedFolder
-      ? [
-          scopedFolder,
-          ...allFolders.filter(
-            (folder) => folder.toString() !== scopedFolder.toString(),
-          ),
-        ]
-      : allFolders;
-
+    const scoped = this.workspaceResolver.getWorkspaceFolder(context);
+    const all = this.workspaceResolver.getWorkspaceFolders();
+    const folders = scoped
+      ? [scoped, ...all.filter((folder) => folder.toString() !== scoped.toString())]
+      : all;
     const snapshots = await Promise.all(
       folders.map((folder) => this.loadWorkspace(folder.fsPath, false)),
     );
@@ -192,21 +174,18 @@ export class RiotEnvManager implements EnvironmentManager {
     this.snapshots.clear();
   }
 
-  /** Force reinstall an environment while preserving its selection. */
   async forceReinstallEnvironment(
     scope: GetEnvironmentScope,
     environment: PythonEnvironment,
   ): Promise<void> {
     const folder = this.workspaceResolver.getWorkspaceFolder(scope, environment);
     if (!folder) {
-      throw new Error("Unable to determine the Riot workspace for this environment");
+      throw new Error("Unable to determine the suitespec workspace");
     }
-
     const record = await this.getEnvironmentRecord(environment, false);
     if (!record) {
-      throw new Error(`Riot environment not found: ${environment.displayName}`);
+      throw new Error(`Suite environment not found: ${environment.displayName}`);
     }
-
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
@@ -217,17 +196,12 @@ export class RiotEnvManager implements EnvironmentManager {
         const controller = new AbortController();
         token.onCancellationRequested(() => controller.abort());
         progress.report({ message: "Running rt build --force-reinstall" });
-        await this.cliService.buildEnvironment(
-          record.context.hash,
-          folder.fsPath,
-          {
-            forceReinstall: true,
-            signal: controller.signal,
-          },
-        );
+        await this.cliService.buildEnvironment(record.run.id, folder.fsPath, {
+          forceReinstall: true,
+          signal: controller.signal,
+        });
       },
     );
-
     const refreshed = await this.loadWorkspace(folder.fsPath, true);
     const updated = this.findRecord(refreshed, environment)?.environment;
     if (updated && this.currentEnvironment.has(folder.fsPath)) {
@@ -235,11 +209,10 @@ export class RiotEnvManager implements EnvironmentManager {
     }
   }
 
-  /** Return cached/indexed Riot data for the package provider. */
   async getEnvironmentRecord(
     environment: PythonEnvironment,
     forceRefresh: boolean,
-  ): Promise<RiotEnvironmentRecord | undefined> {
+  ): Promise<SuitespecEnvironmentRecord | undefined> {
     const known = this.findKnownRecord(environment);
     const folder = known
       ? vscode.Uri.file(known.workspaceRoot)
@@ -247,68 +220,112 @@ export class RiotEnvManager implements EnvironmentManager {
     if (!folder) {
       return known;
     }
-
-    const snapshot = await this.loadWorkspace(folder.fsPath, forceRefresh);
-    return this.findRecord(snapshot, environment);
+    return this.findRecord(
+      await this.loadWorkspace(folder.fsPath, forceRefresh),
+      environment,
+    );
   }
 
-  /** Return already-discovered Riot data for synchronous API hooks. */
   getKnownEnvironmentRecord(
     environment: PythonEnvironment,
-  ): RiotEnvironmentRecord | undefined {
+  ): SuitespecEnvironmentRecord | undefined {
     return this.findKnownRecord(environment);
   }
 
-  /** Get venv indexes by workspace for the indicator service. */
-  async getVenvIndexesByWorkspace(): Promise<Map<string, Map<string, RtVenv>>> {
+  async getSuitesByWorkspace(): Promise<Map<string, RtSuite[]>> {
     const folders = this.workspaceResolver.getWorkspaceFolders();
     const snapshots = await Promise.all(
       folders.map((folder) => this.loadWorkspace(folder.fsPath, false)),
     );
-    const indexes = new Map<string, Map<string, RtVenv>>();
+    const result = new Map<string, RtSuite[]>();
     folders.forEach((folder, index) => {
-      const venvs = snapshots[index].venvs;
-      if (venvs.length > 0) {
-        indexes.set(folder.fsPath, this.buildVenvIndex(venvs));
+      if (snapshots[index].suites.length > 0) {
+        result.set(folder.fsPath, snapshots[index].suites);
       }
     });
-    return indexes;
+    return result;
   }
 
-  /** Build a stable Python environment object from Riot JSON output. */
   buildEnvironment(
-    venv: RtVenv,
-    context: RtExecutionContext,
+    suite: RtSuite,
+    testEnvironment: RtTestEnvironment,
+    run: RtTestRun,
     workspaceRoot?: string,
   ): PythonEnvironment {
     const displayPath =
-      workspaceRoot && path.isAbsolute(context.venv_path)
-        ? path.relative(workspaceRoot, context.venv_path)
-        : context.venv_path;
-    const activation = this.buildShellActivation(context.activate_path);
-
+      workspaceRoot && path.isAbsolute(run.venv_path)
+        ? path.relative(workspaceRoot, run.venv_path)
+        : run.venv_path;
+    const activation = this.buildShellActivation(run.activate_path);
     return {
-      name: venv.name,
-      displayName: context.display_name,
-      shortDisplayName: context.short_display_name,
+      name: testEnvironment.name,
+      displayName: run.display_name,
+      shortDisplayName: run.short_display_name,
       displayPath,
-      version: venv.python,
-      group: venv.name,
-      environmentPath: vscode.Uri.file(context.venv_path),
-      tooltip: `Riot context ${context.hash}${workspaceRoot ? ` in ${workspaceRoot}` : ""}`,
+      version: testEnvironment.python,
+      group: this.buildSuiteGroup(suite),
+      environmentPath: vscode.Uri.file(run.venv_path),
+      description: testEnvironment.integration_name,
+      tooltip: this.buildEnvironmentTooltip(suite, testEnvironment, run),
       execInfo: {
-        run: { executable: context.python_path },
-        activatedRun: { executable: context.python_path },
+        run: { executable: run.python_path },
+        activatedRun: { executable: run.python_path },
         activation: activation.get("unknown"),
         deactivation: [{ executable: "deactivate" }],
         shellActivation: activation,
       },
-      sysPrefix: context.venv_path,
+      sysPrefix: testEnvironment.venv_path,
       envId: {
-        id: vscode.Uri.file(path.resolve(context.venv_path)).toString(),
+        id: vscode.Uri.file(path.resolve(run.venv_path)).toString(),
         managerId: this.managerId,
       },
     };
+  }
+
+  private buildSuiteGroup(suite: RtSuite): EnvironmentGroupInfo {
+    const variants = suite.environments.length;
+    const services = suite.services.length
+      ? ` · services: ${suite.services.join(", ")}`
+      : "";
+    const tooltip = [
+      `Suite: ${suite.id}`,
+      suite.source_files.length
+        ? `Sources: ${suite.source_files.join(", ")}`
+        : undefined,
+      suite.patterns.length ? `Patterns: ${suite.patterns.join(", ")}` : undefined,
+      suite.services.length ? `Services: ${suite.services.join(", ")}` : undefined,
+      Object.keys(suite.suite_env).length
+        ? `Environment: ${formatRecord(suite.suite_env)}`
+        : undefined,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    return {
+      name: suite.id,
+      description: `${variants} dependency environment${variants === 1 ? "" : "s"}${services}`,
+      tooltip,
+    };
+  }
+
+  private buildEnvironmentTooltip(
+    suite: RtSuite,
+    environment: RtTestEnvironment,
+    run: RtTestRun,
+  ): string {
+    return [
+      `Suite: ${suite.id}`,
+      `Dependency environment: ${environment.name} (${environment.hash})`,
+      `Python: ${environment.python}`,
+      `Run: ${run.index + 1} (${run.id})`,
+      environment.direct_dependencies.length
+        ? `Direct dependencies: ${environment.direct_dependencies.join(", ")}`
+        : "Direct dependencies: none",
+      `Lockfile: ${environment.lockfile}`,
+      Object.keys(run.env).length ? `Run environment: ${formatRecord(run.env)}` : undefined,
+      `Profile: ${run.profile_path}`,
+    ]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
   }
 
   private async loadWorkspace(
@@ -321,24 +338,22 @@ export class RiotEnvManager implements EnvironmentManager {
         return cached;
       }
     }
-
     const ongoing = this.ongoingLoads.get(cwd);
     if (ongoing) {
       return ongoing;
     }
-
     const previous = this.snapshots.get(cwd);
     let load!: Promise<WorkspaceSnapshot>;
     load = this.cliService
-      .listEnvironments(cwd)
-      .then((venvs) => {
-        const snapshot = this.buildSnapshot(cwd, venvs);
+      .listSuites(cwd)
+      .then((suites) => {
+        const snapshot = this.buildSnapshot(cwd, suites);
         this.snapshots.set(cwd, snapshot);
         return snapshot;
       })
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
-        this.log.error(`Failed to fetch Riot environments for ${cwd}: ${message}`);
+        this.log.error(`Failed to fetch suitespec environments for ${cwd}: ${message}`);
         if (previous) {
           return previous;
         }
@@ -355,46 +370,43 @@ export class RiotEnvManager implements EnvironmentManager {
     return load;
   }
 
-  private buildSnapshot(cwd: string, venvs: RtVenv[]): WorkspaceSnapshot {
+  private buildSnapshot(cwd: string, suites: RtSuite[]): WorkspaceSnapshot {
     const environments: PythonEnvironment[] = [];
-    const recordsById = new Map<string, RiotEnvironmentRecord>();
-    const recordsByHash = new Map<string, RiotEnvironmentRecord>();
-
-    for (const venv of venvs) {
-      for (const context of venv.execution_contexts ?? []) {
-        const environment = this.buildEnvironment(venv, context, cwd);
-        const record: RiotEnvironmentRecord = {
-          workspaceRoot: cwd,
-          venv,
-          context,
-          environment,
-        };
-        environments.push(environment);
-        recordsById.set(environment.envId.id, record);
-        recordsByHash.set(context.hash, record);
+    const recordsById = new Map<string, SuitespecEnvironmentRecord>();
+    const recordsByRunId = new Map<string, SuitespecEnvironmentRecord>();
+    for (const suite of suites) {
+      for (const testEnvironment of suite.environments) {
+        for (const run of testEnvironment.runs) {
+          const environment = this.buildEnvironment(
+            suite,
+            testEnvironment,
+            run,
+            cwd,
+          );
+          const record = { workspaceRoot: cwd, suite, testEnvironment, run, environment };
+          environments.push(environment);
+          recordsById.set(environment.envId.id, record);
+          recordsByRunId.set(run.id, record);
+        }
       }
     }
-
-    return { venvs, environments, recordsById, recordsByHash };
+    return { suites, environments, recordsById, recordsByRunId };
   }
 
   private async reconcileCurrentEnvironment(
     folder: vscode.Uri,
     snapshot: WorkspaceSnapshot,
   ): Promise<void> {
-    const cwd = folder.fsPath;
-    const current = this.currentEnvironment.get(cwd);
+    const current = this.currentEnvironment.get(folder.fsPath);
     if (!current) {
       return;
     }
-
     const updated = this.findRecord(snapshot, current)?.environment;
     if (updated && this.environmentExecutableExists(updated)) {
-      this.currentEnvironment.set(cwd, updated);
+      this.currentEnvironment.set(folder.fsPath, updated);
       return;
     }
-
-    this.currentEnvironment.delete(cwd);
+    this.currentEnvironment.delete(folder.fsPath);
     await this.testingConfigManager.clearConfiguration(folder);
     this.envEmitter.fire({ uri: folder, old: current, new: undefined });
   }
@@ -419,13 +431,11 @@ export class RiotEnvManager implements EnvironmentManager {
   ): Promise<void> {
     let record = await this.getEnvironmentRecord(requested, false);
     if (!record || record.workspaceRoot !== cwd) {
-      const snapshot = await this.loadWorkspace(cwd, false);
-      record = this.findRecord(snapshot, requested);
+      record = this.findRecord(await this.loadWorkspace(cwd, false), requested);
     }
     if (!record) {
-      throw new Error(`Riot environment not found: ${requested.displayName}`);
+      throw new Error(`Suite environment not found: ${requested.displayName}`);
     }
-
     if (!(await this.environmentIsReady(record))) {
       const controller = new AbortController();
       this.ongoingActivations.set(cwd, controller);
@@ -439,7 +449,7 @@ export class RiotEnvManager implements EnvironmentManager {
           async (progress, token) => {
             token.onCancellationRequested(() => controller.abort());
             progress.report({ message: "Running rt build" });
-            await this.cliService.buildEnvironment(record!.context.hash, cwd, {
+            await this.cliService.buildEnvironment(record!.run.id, cwd, {
               signal: controller.signal,
             });
           },
@@ -449,17 +459,13 @@ export class RiotEnvManager implements EnvironmentManager {
           this.ongoingActivations.delete(cwd);
         }
       }
-
       const refreshed = await this.loadWorkspace(cwd, true);
       record = this.findRecord(refreshed, requested);
       if (!record || !(await this.environmentIsReady(record))) {
-        throw new Error(
-          `Environment not ready after build: ${requested.displayName}`,
-        );
+        throw new Error(`Environment not ready after build: ${requested.displayName}`);
       }
     }
-
-    await this.testingConfigManager.updateConfiguration(folder, record.context);
+    await this.testingConfigManager.updateConfiguration(folder, record.run);
     this.currentEnvironment.set(cwd, record.environment);
     if (previous?.envId.id !== record.environment.envId.id) {
       this.envEmitter.fire({ uri: folder, old: previous, new: record.environment });
@@ -469,14 +475,14 @@ export class RiotEnvManager implements EnvironmentManager {
   private cancelActivation(cwd: string): void {
     const controller = this.ongoingActivations.get(cwd);
     if (controller) {
-      this.log.info(`Cancelling previous environment activation for ${cwd}`);
+      this.log.info(`Cancelling previous suite environment activation for ${cwd}`);
       controller.abort();
     }
   }
 
   private findKnownRecord(
     environment: PythonEnvironment,
-  ): RiotEnvironmentRecord | undefined {
+  ): SuitespecEnvironmentRecord | undefined {
     for (const snapshot of this.snapshots.values()) {
       const record = this.findRecord(snapshot, environment);
       if (record) {
@@ -489,10 +495,10 @@ export class RiotEnvManager implements EnvironmentManager {
   private findRecord(
     snapshot: WorkspaceSnapshot,
     environment: PythonEnvironment,
-  ): RiotEnvironmentRecord | undefined {
+  ): SuitespecEnvironmentRecord | undefined {
     return (
       snapshot.recordsById.get(environment.envId.id) ??
-      snapshot.recordsByHash.get(environment.envId.id) ??
+      snapshot.recordsByRunId.get(environment.envId.id) ??
       Array.from(snapshot.recordsById.values()).find((record) =>
         this.matchesPath(record.environment, environment.environmentPath.fsPath),
       )
@@ -506,7 +512,6 @@ export class RiotEnvManager implements EnvironmentManager {
     const changes: DidChangeEnvironmentsEventArgs = [];
     const previousIds = new Set(previous.map((environment) => environment.envId.id));
     const nextIds = new Set(next.map((environment) => environment.envId.id));
-
     for (const environment of next) {
       if (!previousIds.has(environment.envId.id)) {
         changes.push({ kind: EnvironmentChangeKind.add, environment });
@@ -518,17 +523,6 @@ export class RiotEnvManager implements EnvironmentManager {
       }
     }
     return changes;
-  }
-
-  private buildVenvIndex(venvs: RtVenv[]): Map<string, RtVenv> {
-    const index = new Map<string, RtVenv>();
-    for (const venv of venvs) {
-      index.set(venv.hash, venv);
-      for (const context of venv.execution_contexts ?? []) {
-        index.set(context.hash, venv);
-      }
-    }
-    return index;
   }
 
   private buildShellActivation(
@@ -543,33 +537,9 @@ export class RiotEnvManager implements EnvironmentManager {
       ["gitbash", posix],
       ["zsh", posix],
       ["ksh", [{ executable: ".", args: [activatePath] }]],
-      [
-        "fish",
-        [
-          {
-            executable: "source",
-            args: [path.join(binDirectory, "activate.fish")],
-          },
-        ],
-      ],
-      [
-        "csh",
-        [
-          {
-            executable: "source",
-            args: [path.join(binDirectory, "activate.csh")],
-          },
-        ],
-      ],
-      [
-        "tcsh",
-        [
-          {
-            executable: "source",
-            args: [path.join(binDirectory, "activate.csh")],
-          },
-        ],
-      ],
+      ["fish", [{ executable: "source", args: [path.join(binDirectory, "activate.fish")] }]],
+      ["csh", [{ executable: "source", args: [path.join(binDirectory, "activate.csh")] }]],
+      ["tcsh", [{ executable: "source", args: [path.join(binDirectory, "activate.csh")] }]],
     ]);
   }
 
@@ -577,28 +547,38 @@ export class RiotEnvManager implements EnvironmentManager {
     return fs.existsSync(environment.execInfo.run.executable);
   }
 
-  private async environmentIsReady(record: RiotEnvironmentRecord): Promise<boolean> {
+  private async environmentIsReady(
+    record: SuitespecEnvironmentRecord,
+  ): Promise<boolean> {
     return (
       this.environmentExecutableExists(record.environment) &&
-      (await this.cliService.isVenvReady(record.context.hash, record.workspaceRoot))
+      (await this.cliService.isEnvironmentReady(
+        record.run.id,
+        record.run.profile_fingerprint,
+        record.workspaceRoot,
+      ))
     );
   }
 
   private matchesPath(environment: PythonEnvironment, targetPath: string): boolean {
-    const target = this.normalizeFsPath(targetPath);
-    const environmentPath = this.normalizeFsPath(
-      environment.environmentPath.fsPath,
-    );
-    const executable = this.normalizeFsPath(environment.execInfo.run.executable);
+    const target = normalizeFsPath(targetPath);
+    const environmentPath = normalizeFsPath(environment.environmentPath.fsPath);
+    const executable = normalizeFsPath(environment.execInfo.run.executable);
     return (
       target === environmentPath ||
       target === executable ||
-      target === this.normalizeFsPath(path.dirname(executable))
+      target === normalizeFsPath(path.dirname(executable))
     );
   }
+}
 
-  private normalizeFsPath(value: string): string {
-    const normalized = path.resolve(value);
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  }
+function normalizeFsPath(value: string): string {
+  const normalized = path.resolve(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function formatRecord(values: Record<string, string>): string {
+  return Object.entries(values)
+    .map(([name, value]) => `${name}=${value}`)
+    .join(", ");
 }

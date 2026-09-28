@@ -6,7 +6,7 @@ import * as cp from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
-import { RtVenv } from "../types/rtTypes";
+import { RtSuite, RtSuiteIndex } from "../types/rtTypes";
 
 const MAX_BUFFER_BYTES = 20 * 1024 * 1024; // 20MB to handle large rt list outputs
 
@@ -65,12 +65,12 @@ export class RtCliService {
           cleanup();
 
           if (stderr?.trim()) {
-            this.log.appendLine(`[riot] ${stderr.trim()}`);
+            this.log.appendLine(`[rt] ${stderr.trim()}`);
           }
 
           if (err) {
             const message = err instanceof Error ? err.message : String(err);
-            this.log.appendLine(`[riot] rt ${args.join(" ")} failed: ${message}`);
+            this.log.appendLine(`[rt] rt ${args.join(" ")} failed: ${message}`);
             reject(err);
             return;
           }
@@ -90,35 +90,48 @@ export class RtCliService {
   }
 
   /**
-   * List all Riot virtual environments
+   * List suitespec suites and their concrete run profiles.
    */
-  async listEnvironments(cwd: string, signal?: AbortSignal): Promise<RtVenv[]> {
+  async listSuites(cwd: string, signal?: AbortSignal): Promise<RtSuite[]> {
     const stdout = await this.execute(["list", "--json"], { cwd, signal });
-    return JSON.parse(stdout);
+    const index = JSON.parse(stdout) as Partial<RtSuiteIndex>;
+    if (index.schema_version !== 1 || !Array.isArray(index.suites)) {
+      throw new Error(
+        `Unsupported rt list schema: expected schema_version 1, got ${JSON.stringify(index.schema_version)}`,
+      );
+    }
+    return index.suites;
   }
 
   /**
-   * Build a Riot environment by hash
+   * Build a suite environment or logical run profile by selector.
    */
   async buildEnvironment(
-    hash: string,
+    selector: string,
     cwd: string,
     options?: {
       forceReinstall?: boolean;
       signal?: AbortSignal;
     },
   ): Promise<void> {
-    const args = ["build", hash];
+    const args = ["build", selector];
     if (options?.forceReinstall) {
       args.push("--force-reinstall");
     }
     await this.execute(args, { cwd, signal: options?.signal });
   }
 
-  /** Check whether rt considers an execution-context environment complete. */
-  async isVenvReady(hash: string, cwd: string): Promise<boolean> {
+  /** Check whether rt considers a logical run profile complete. */
+  async isEnvironmentReady(
+    selector: string,
+    profileFingerprint: string,
+    cwd: string,
+  ): Promise<boolean> {
     const stdout = (
-      await this.execute(["_is_venv_ready", hash], { cwd })
+      await this.execute(
+        ["_is_venv_ready", selector, "--profile-fingerprint", profileFingerprint],
+        { cwd },
+      )
     ).trim();
     if (stdout === "true") {
       return true;
@@ -138,11 +151,11 @@ function resolveRtCommand(
     const bundled = path.join(extensionPath, "runtime", "bin", "rt");
     try {
       fs.accessSync(bundled, fs.constants.X_OK);
-      log.appendLine(`[riot] Using bundled rt binary at ${bundled}`);
+      log.appendLine(`[rt] Using bundled rt binary at ${bundled}`);
       return bundled;
     } catch {
       log.appendLine(
-        `[riot] Bundled rt binary not found at ${bundled}; falling back to 'rt' on PATH`,
+        `[rt] Bundled rt binary not found at ${bundled}; falling back to 'rt' on PATH`,
       );
     }
   }

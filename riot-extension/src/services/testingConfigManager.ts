@@ -4,7 +4,8 @@
  */
 
 import * as vscode from "vscode";
-import { RtExecutionContext } from "../types/rtTypes";
+import { RtTestRun } from "../types/rtTypes";
+import { pytestConfigurationArgs } from "./pytestConfig";
 
 export class TestingConfigurationManager {
   constructor(private readonly log: vscode.LogOutputChannel) {}
@@ -14,21 +15,12 @@ export class TestingConfigurationManager {
    */
   async updateConfiguration(
     workspaceFolder: vscode.Uri,
-    context: RtExecutionContext | undefined,
+    run: RtTestRun | undefined,
   ): Promise<void> {
     const config = vscode.workspace.getConfiguration("python", workspaceFolder);
     const target = vscode.ConfigurationTarget.WorkspaceFolder;
 
-    if (context && context.pytest_targets.length === 0) {
-      this.logLine(
-        `Skipped pytest configuration for ${workspaceFolder.fsPath}: ${context.hash} has no pytest targets`,
-      );
-      return;
-    }
-
-    const pytestArgs = context
-      ? [...context.pytest_targets, "--color=yes", "--cov-branch"]
-      : undefined;
+    const pytestArgs = pytestConfigurationArgs(run);
 
     try {
       await Promise.all([
@@ -69,6 +61,6 @@ export class TestingConfigurationManager {
   }
 
   private logLine(message: string): void {
-    this.log.appendLine(`[riot] ${message}`);
+    this.log.appendLine(`[rt] ${message}`);
   }
 }

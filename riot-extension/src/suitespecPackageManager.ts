@@ -8,7 +8,10 @@ import {
   PackageManagementOptions,
   PythonEnvironment,
 } from "./api";
-import { RiotEnvManager, RiotEnvironmentRecord } from "./riotEnvManager";
+import {
+  SuitespecEnvironmentRecord,
+  SuitespecEnvManager,
+} from "./suitespecEnvManager";
 import {
   buildPackageMetadata,
   getDirectPackageNames as directPackageNames,
@@ -16,12 +19,12 @@ import {
 } from "./services/packageMetadata";
 import { buildManagerId } from "./types/rtTypes";
 
-export class RiotPackageManager implements PackageManager {
-  readonly name = "rt";
-  readonly displayName = "Riot (read-only)";
-  readonly description = "Packages declared by Riot";
+export class SuitespecPackageManager implements PackageManager {
+  readonly name = "rt-packages";
+  readonly displayName = "Suitespec dependencies (read-only)";
+  readonly description = "Dependencies declared by suitespec and resolved by its lockfile";
   readonly tooltip =
-    "Riot environments are immutable; edit riotfile.py to change packages";
+    "Suite environments are immutable; edit the relevant suitespec.yml and refresh its lockfile";
   readonly log: vscode.LogOutputChannel;
 
   private readonly managerId: string;
@@ -36,7 +39,7 @@ export class RiotPackageManager implements PackageManager {
 
   constructor(
     log: vscode.LogOutputChannel,
-    private readonly envManager: RiotEnvManager,
+    private readonly envManager: SuitespecEnvManager,
     extensionId: string,
   ) {
     this.log = log;
@@ -48,9 +51,9 @@ export class RiotPackageManager implements PackageManager {
     _options: PackageManagementOptions,
   ): Promise<void> {
     const error = new Error(
-      "Riot environments are immutable. Edit riotfile.py, then refresh or rebuild the environment.",
+      "Suite environments are immutable. Edit suitespec.yml, refresh its lockfile, then refresh or rebuild the environment.",
     );
-    error.name = "RiotEnvironmentImmutableError";
+    error.name = "SuitespecEnvironmentImmutableError";
     return Promise.reject(error);
   }
 
@@ -62,15 +65,11 @@ export class RiotPackageManager implements PackageManager {
         this.pkgEmitter.fire({
           environment,
           manager: this,
-          changes: before.map((pkg) => ({
-            kind: PackageChangeKind.remove,
-            pkg,
-          })),
+          changes: before.map((pkg) => ({ kind: PackageChangeKind.remove, pkg })),
         });
       }
       return;
     }
-
     const changes = getPackageChanges(before, after);
     if (changes.length > 0) {
       this.pkgEmitter.fire({ environment, manager: this, changes });
@@ -91,28 +90,25 @@ export class RiotPackageManager implements PackageManager {
     return this.loadPackages(environment, forceRefresh);
   }
 
-  getPackageWatchTargets(
-    environment: PythonEnvironment,
-  ): vscode.RelativePattern[] {
+  getPackageWatchTargets(environment: PythonEnvironment): vscode.RelativePattern[] {
     const record = this.envManager.getKnownEnvironmentRecord(environment);
     if (!record) {
       return [];
     }
-
-    const riotRoot = path.dirname(record.venv.venv_path);
-    const declarationRoot = path.dirname(riotRoot);
-    const requirementsDirectory = path.join(riotRoot, "requirements");
-    return [
-      new vscode.RelativePattern(declarationRoot, "riotfile.py"),
-      new vscode.RelativePattern(requirementsDirectory, `${record.venv.hash}.txt`),
-    ];
+    const targets = [...record.suite.source_files, record.testEnvironment.lockfile];
+    return targets.map((target) => {
+      const absolute = path.isAbsolute(target)
+        ? target
+        : path.join(record.workspaceRoot, target);
+      return new vscode.RelativePattern(path.dirname(absolute), path.basename(absolute));
+    });
   }
 
   async getDirectPackageNames(
     environment: PythonEnvironment,
   ): Promise<Set<string> | undefined> {
     const record = await this.envManager.getEnvironmentRecord(environment, false);
-    return record ? directPackageNames(record.venv) : undefined;
+    return record ? directPackageNames(record.testEnvironment) : undefined;
   }
 
   async clearCache(): Promise<void> {
@@ -132,22 +128,23 @@ export class RiotPackageManager implements PackageManager {
       this.packageCache.delete(environment.envId.id);
       return undefined;
     }
-
     const packages = this.buildPackages(record);
     this.packageCache.set(environment.envId.id, packages);
     return packages;
   }
 
-  private buildPackages(record: RiotEnvironmentRecord): Package[] {
-    return buildPackageMetadata(record.venv).map((pkg) => ({
-      ...pkg,
-      displayName: pkg.name,
-      pkgId: {
-        id: normalizePackageName(pkg.name),
-        managerId: this.managerId,
-        environmentId: record.environment.envId.id,
-      },
-    }));
+  private buildPackages(record: SuitespecEnvironmentRecord): Package[] {
+    return buildPackageMetadata(record.testEnvironment, record.suite.id).map(
+      (pkg) => ({
+        ...pkg,
+        displayName: pkg.name,
+        pkgId: {
+          id: normalizePackageName(pkg.name),
+          managerId: this.managerId,
+          environmentId: record.environment.envId.id,
+        },
+      }),
+    );
   }
 }
 

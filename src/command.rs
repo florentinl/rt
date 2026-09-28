@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
     io::{self, BufReader, Read},
+    path::Path,
     process::{Command, ExitStatus, Stdio},
     sync::Arc,
     thread,
@@ -76,6 +77,13 @@ impl ManagedCommand {
         V: AsRef<OsStr>,
     {
         self.command.envs(vars);
+        self
+    }
+
+    /// Set the working directory for the command.
+    #[must_use]
+    pub(crate) fn current_dir<P: AsRef<Path>>(mut self, dir: P) -> Self {
+        self.command.current_dir(dir);
         self
     }
 

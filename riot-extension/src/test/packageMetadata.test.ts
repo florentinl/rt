@@ -5,17 +5,17 @@ import {
   getDirectPackageNames,
   normalizePackageName,
 } from "../services/packageMetadata";
-import { RtVenv } from "../types/rtTypes";
+import { RtTestEnvironment } from "../types/rtTypes";
 
 test("normalizes equivalent Python distribution names", () => {
   assert.equal(normalizePackageName("My_Package.Name"), "my-package-name");
   assert.equal(normalizePackageName("my---package"), "my-package");
 });
 
-test("uses Riot declarations to distinguish direct and transitive packages", () => {
+test("uses suitespec declarations to distinguish direct and transitive packages", () => {
   const packages = buildPackageMetadata(
-    makeVenv({
-      pkgs: { Requests: ">=2" },
+    makeEnvironment({
+      direct_dependencies: ["Requests>=2"],
       resolved_pkgs: { requests: "2.32.4", urllib3: "2.5.0" },
       display_pkgs: {
         Requests: "2.32.4 (>=2)",
@@ -37,13 +37,18 @@ test("uses Riot declarations to distinguish direct and transitive packages", () 
   );
   assert.match(packages[0].tooltip, /Declared: Requests>=2/);
   assert.match(packages[0].tooltip, /Installed: 2\.32\.4/);
-  assert.deepEqual(getDirectPackageNames(makeVenv({ pkgs: { Requests: ">=2" } })), new Set(["requests"]));
+  assert.deepEqual(
+    getDirectPackageNames(
+      makeEnvironment({ direct_dependencies: ["Requests[socks]>=2"] }),
+    ),
+    new Set(["requests"]),
+  );
 });
 
 test("does not present a constraint as an installed version", () => {
   const [pkg] = buildPackageMetadata(
-    makeVenv({
-      pkgs: { pytest: ">=8" },
+    makeEnvironment({
+      direct_dependencies: ["pytest>=8"],
       display_pkgs: { pytest: "(>=8)" },
     }),
   );
@@ -52,18 +57,22 @@ test("does not present a constraint as an installed version", () => {
   assert.match(pkg.tooltip, /Installed: not resolved/);
 });
 
-function makeVenv(overrides: Partial<RtVenv>): RtVenv {
+function makeEnvironment(
+  overrides: Partial<RtTestEnvironment>,
+): RtTestEnvironment {
   return {
     hash: "1234567",
-    venv_path: "/workspace/.riot/venv_1234567",
+    venv_path: "/workspace/.cache/rt/environments/1234567",
+    python_path: "/workspace/.cache/rt/environments/1234567/bin/python",
+    activate_path: "/workspace/.cache/rt/environments/1234567/bin/activate",
     name: "test",
+    integration_name: "test",
     python: "3.13",
-    services: [],
-    suite_env: {},
-    pkgs: {},
+    direct_dependencies: [],
     resolved_pkgs: {},
     display_pkgs: {},
-    execution_contexts: [],
+    lockfile: "/workspace/.uv/locks/1234567.txt",
+    runs: [],
     ...overrides,
   };
 }

@@ -1,33 +1,55 @@
-/**
- * Shared type definitions for Riot extension
- */
+/** Machine-readable suitespec model returned by `rt list --json`. */
 
-export type RtExecutionContext = {
-    hash: string;
-    venv_path: string;
-    python_path: string;
-    activate_path: string;
-    display_name: string;
-    short_display_name: string;
-    command?: string;
-    pytest_targets: string[];
-    env: Record<string, string>;
-    create: boolean;
-    skip_dev_install: boolean;
-};
+export interface RtSuiteIndex {
+  readonly schema_version: 1;
+  readonly suites: RtSuite[];
+}
 
-export type RtVenv = {
-    hash: string;
-    venv_path: string;
-    name: string;
-    python: string;
-    services: string[];
-    suite_env: Record<string, string>;
-    pkgs: Record<string, string>;
-    resolved_pkgs: Record<string, string>;
-    display_pkgs: Record<string, string>;
-    execution_contexts: RtExecutionContext[];
-};
+export interface RtSuite {
+  readonly id: string;
+  readonly name: string;
+  readonly patterns: string[];
+  readonly source_files: string[];
+  readonly services: string[];
+  readonly suite_env: Record<string, string>;
+  readonly environments: RtTestEnvironment[];
+}
+
+export interface RtTestEnvironment {
+  readonly hash: string;
+  readonly name: string;
+  readonly integration_name: string;
+  readonly python: string;
+  readonly direct_dependencies: string[];
+  readonly resolved_pkgs: Record<string, string>;
+  readonly display_pkgs: Record<string, string>;
+  readonly lockfile: string;
+  /** Physical dependency environment shared by every run. */
+  readonly venv_path: string;
+  readonly python_path: string;
+  readonly activate_path: string;
+  readonly runs: RtTestRun[];
+}
+
+export interface RtTestRun {
+  /** Stable selector accepted by `rt build` and `_is_venv_ready`. */
+  readonly id: string;
+  readonly index: number;
+  readonly command: string;
+  readonly env: Record<string, string>;
+  /** Authoritative pytest arguments from the suitespec command, without `{cmdargs}`. */
+  readonly pytest_args: string[];
+  readonly pytest_targets: string[];
+  /** Fingerprint of every input that affects the immutable run profile. */
+  readonly profile_fingerprint: string;
+  readonly profile_path: string;
+  readonly display_name: string;
+  readonly short_display_name: string;
+  /** Logical profile environment. Its launcher selects `profile_path`. */
+  readonly venv_path: string;
+  readonly python_path: string;
+  readonly activate_path: string;
+}
 
 export const buildManagerId = (extensionId: string, name: string): string =>
-    `${extensionId}:${name.toLowerCase().replace(/[^a-zA-Z0-9-_]/g, '_')}`;
+  `${extensionId}:${name.toLowerCase().replace(/[^a-zA-Z0-9-_]/g, "_")}`;

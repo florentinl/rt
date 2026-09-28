@@ -7,109 +7,57 @@ use std::{
 use indexmap::IndexMap;
 
 use crate::{
-    commands::build::build_selected_contexts,
+    commands::build::build_selected_environments,
     config::{RepoConfig, Selector},
     error::{RtError, RtResult},
     ui,
-    venv::{ExecutionContext, RiotVenv, select_execution_contexts, venv_python_path},
+    venv::{Suite, TestEnvironment, profile_path, select_test_environments},
 };
 
-/// Build the requested environment and spawn an interactive shell with it active.
-///
-/// # Errors
-///
-/// Returns an error if the target cannot be resolved, built, or launched.
 pub fn run(
-    venvs: IndexMap<String, RiotVenv>,
+    suites: &IndexMap<String, Suite>,
     repo: &RepoConfig,
-    hash: &str,
+    selector: &str,
     force_reinstall: bool,
 ) -> RtResult<()> {
-    let target = resolve_target(venvs, hash)?;
-
-    build_selected_contexts(repo, std::slice::from_ref(&target), force_reinstall, false)?;
-    let ctx = &target.execution_contexts[0];
-    ui::step(format!("Spawning shell for execution context {}", ctx.hash));
-
-    launch_shell(repo, ctx)?;
-
-    Ok(())
-}
-
-/// Resolve a selector to a single venv, narrowing to an execution context when needed.
-///
-/// # Errors
-///
-/// Returns an error if selection is ambiguous or selection fails.
-pub fn resolve_target(venvs: IndexMap<String, RiotVenv>, hash: &str) -> RtResult<RiotVenv> {
-    let mut venvs = select_execution_contexts(venvs, Selector::Pattern(hash.to_string()))?;
-    if venvs.len() != 1 {
-        return Err(RtError::message(format!(
-            "Expected one corresponding virtual environment, found {}",
-            venvs.len()
-        )));
-    }
-    let mut venv = venvs.pop().expect("the selected venv count is one");
-
-    venv.execution_contexts.retain(|exc| exc.hash == hash);
-
-    match venv.execution_contexts.len() {
-        0 => venv.execution_contexts.push(ExecutionContext {
-            command: None,
-            pytest_targets: Vec::new(),
-            env: IndexMap::new(),
-            create: false,
-            skip_dev_install: false,
-            hash: venv.hash.clone(),
-        }),
-        1 => {}
-        count => {
-            return Err(RtError::message(format!(
-                "Expected one corresponding execution context, found {count}"
-            )));
-        }
-    }
-    Ok(venv)
-}
-
-fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {
-    let python_path = venv_python_path(&repo.riot_root, &exc_ctx.hash);
-
+    let target = resolve_target(suites, selector)?;
+    build_selected_environments(repo, std::slice::from_ref(&target), force_reinstall, false)?;
+    let run = target
+        .runs
+        .first()
+        .ok_or_else(|| RtError::message("error: test environment has no run"))?;
+    ui::step(format!("Spawning shell for test run {}", run.id));
+    let profile = profile_path(&repo.cache_root, &target.hash, run.index);
+    let physical = crate::venv::environment_path(&repo.cache_root, &target.hash);
     let shell = preferred_shell();
-    ui::detail(format!(
-        "Starting {} with virtual environment {} active",
-        shell.to_string_lossy(),
-        exc_ctx.hash
-    ));
-
-    let uv = std::env::var_os("_RT_UV_BIN").unwrap_or_else(|| std::ffi::OsString::from("uv"));
-    let mut command = Command::new(uv);
+    let mut command = Command::new(&shell);
     command
-        .arg("run")
-        .arg("--no-config")
-        .arg("--color=always")
-        .arg("--no-project")
-        .arg("--python")
-        .arg(&python_path)
-        .arg("--")
-        .arg(&shell)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .env("UV_PYTHON_PREFERENCE", "only-managed")
-        .env("FORCE_COLOR", "1");
-
-    for (key, value) in &exc_ctx.env {
-        command.env(key, value);
-    }
-
-    let status = command.status().map_err(|err| {
+        .current_dir(&repo.project_root)
+        .env("VIRTUAL_ENV", &physical)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}:{}",
+                profile.join("bin").display(),
+                physical.join("bin").display(),
+                env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env(
+            "RT_CONTEXT_PATH",
+            profile.join(crate::constants::RUNTIME_CONFIG),
+        )
+        .envs(&target.suite_env)
+        .envs(&run.env);
+    let status = command.status().map_err(|error| {
         RtError::message(format!(
-            "error: failed to spawn shell for {}: {err}",
-            exc_ctx.hash
+            "error: failed to spawn shell for {}: {error}",
+            run.id
         ))
     })?;
-
     if status.success() {
         Ok(())
     } else {
@@ -117,14 +65,35 @@ fn launch_shell(repo: &RepoConfig, exc_ctx: &ExecutionContext) -> RtResult<()> {
     }
 }
 
+pub fn resolve_target(
+    suites: &IndexMap<String, Suite>,
+    selector: &str,
+) -> RtResult<TestEnvironment> {
+    let mut selected = select_test_environments(suites, Selector::Pattern(selector.to_owned()))?;
+    if selected.len() != 1 {
+        return Err(RtError::message(format!(
+            "Expected one test environment, found {}",
+            selected.len()
+        )));
+    }
+    let mut environment = selected.pop().expect("one selected environment");
+    if environment.runs.len() > 1 {
+        if let Some(run) = environment
+            .runs
+            .iter()
+            .find(|run| run.id == selector)
+            .cloned()
+        {
+            environment.runs = vec![run];
+        } else {
+            environment.runs.truncate(1);
+        }
+    }
+    Ok(environment)
+}
+
 fn preferred_shell() -> OsString {
     env::var_os("SHELL")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                OsString::from("cmd.exe")
-            } else {
-                OsString::from("sh")
-            }
-        })
+        .unwrap_or_else(|| OsString::from("sh"))
 }

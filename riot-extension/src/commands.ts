@@ -1,22 +1,22 @@
 /**
- * Command handlers for Riot extension
+ * Command handlers for suitespec environments.
  */
 
 import * as vscode from "vscode";
 import { PythonEnvironment, PythonEnvironmentApi } from "./api";
-import { RiotEnvManager } from "./riotEnvManager";
+import { SuitespecEnvManager } from "./suitespecEnvManager";
 import { buildManagerId } from "./types/rtTypes";
 
 /**
- * Register all Riot commands
+ * Register all rt suite commands.
  */
 export function registerCommands(
   context: vscode.ExtensionContext,
   api: PythonEnvironmentApi,
-  envManager: RiotEnvManager,
+  envManager: SuitespecEnvManager,
   extensionId: string,
 ): void {
-  const riotManagerId = buildManagerId(extensionId, "riot");
+  const rtManagerId = buildManagerId(extensionId, "rt");
 
   // Force reinstall environment command
   const forceReinstallCommand = vscode.commands.registerCommand(
@@ -25,7 +25,7 @@ export function registerCommands(
       const scope = await selectWorkspaceFolder();
       if (!scope) {
         void vscode.window.showErrorMessage(
-          "No workspace folder selected for Riot environment actions.",
+          "No workspace folder selected for suite environment actions.",
         );
         return;
       }
@@ -43,14 +43,14 @@ export function registerCommands(
 
       if (!environment) {
         void vscode.window.showErrorMessage(
-          "No Python environment selected. Select a Riot-managed environment and try again.",
+          "No Python environment selected. Select an rt suite environment and try again.",
         );
         return;
       }
 
-      if (environment.envId.managerId !== riotManagerId) {
+      if (environment.envId.managerId !== rtManagerId) {
         void vscode.window.showErrorMessage(
-          "The selected Python environment is not managed by Riot. Select a Riot-managed environment and try again.",
+          "The selected Python environment is not managed by rt. Select a suite environment and try again.",
         );
         return;
       }
@@ -92,7 +92,7 @@ async function selectWorkspaceFolder(): Promise<vscode.Uri | undefined> {
         uri: folder.uri,
       })),
       {
-        placeHolder: "Select a workspace folder for the Riot environment",
+        placeHolder: "Select a workspace folder for the suite environment",
       },
     );
     return pick?.uri;

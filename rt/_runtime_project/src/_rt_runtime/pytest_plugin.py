@@ -1,11 +1,10 @@
-"""
-Pytest plugin to strip the global Python-version suffix added by tests/conftest.py.
+"""Pytest integration for an rt-managed suitespec run profile.
 
 It has three functions:
 - restore the original item names and nodeids so that IDE integrations can map collected tests correctly.
 - start and stop suitespec services, using the same compose project, compose
   files and testagent port discovery as dd-trace-py's scripts/run-tests
-- restore the datadog service, as if it was parsed from the command in the riotfile.py
+- restore the inferred Datadog service from the suitespec run command
 """
 
 import hashlib
@@ -22,7 +21,7 @@ from _rt_runtime import get_context
 _RT_CONTEXT = get_context()
 _PROJECT_ROOT = _RT_CONTEXT["project_root"]
 _SERVICES = _RT_CONTEXT["services"]
-_ORIGINAL_COMMAND = _RT_CONTEXT["command"]
+_RUN_COMMAND = _RT_CONTEXT["command"]
 _PY_TAG = f"py{sys.version_info.major}.{sys.version_info.minor}"
 _PY_SUFFIX = f"[{_PY_TAG}]"
 
@@ -119,12 +118,12 @@ with suppress(Exception):
             # nodeid is stored on the private _nodeid attribute when mutation is needed
             item._nodeid = _strip_suffix(item.nodeid)
 
-    _RIOT_ENTRYPOINT_ENV = "RIOT_ENTRYPOINT_PID"
+    _RT_ENTRYPOINT_ENV = "RT_ENTRYPOINT_PID"
 
     def _is_entrypoint() -> bool:
-        owner_pid = os.environ.get(_RIOT_ENTRYPOINT_ENV)
+        owner_pid = os.environ.get(_RT_ENTRYPOINT_ENV)
         if not owner_pid:
-            os.environ[_RIOT_ENTRYPOINT_ENV] = str(os.getpid())
+            os.environ[_RT_ENTRYPOINT_ENV] = str(os.getpid())
             return True
         return owner_pid == str(os.getpid())
 
@@ -146,9 +145,9 @@ with suppress(Exception):
 
         # Restore service name (otherwise it can be overriden to something like `vscode_pytest`)
         with suppress(Exception):
-            if not _ORIGINAL_COMMAND:
+            if not _RUN_COMMAND:
                 return
-            argv = shlex.split(_ORIGINAL_COMMAND)
+            argv = shlex.split(_RUN_COMMAND)
 
             from ddtrace.internal.settings._inferred_base_service import detect_service
             from ddtrace.internal.schema.processor import BaseServiceProcessor

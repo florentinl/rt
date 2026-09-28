@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 pub struct RepoConfig {
-    pub riotfile_path: PathBuf,
-    pub riot_root: PathBuf,
+    pub project_root: PathBuf,
+    pub cache_root: PathBuf,
 }
 
 pub enum Selector {

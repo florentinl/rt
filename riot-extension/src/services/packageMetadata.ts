@@ -1,6 +1,6 @@
-import { RtVenv } from "../types/rtTypes";
+import { RtTestEnvironment } from "../types/rtTypes";
 
-interface RiotPackageMetadata {
+interface SuitePackageMetadata {
   readonly name: string;
   readonly version?: string;
   readonly tooltip: string;
@@ -12,19 +12,28 @@ export function normalizePackageName(name: string): string {
   return name.toLowerCase().replace(/[-_.]+/g, "-");
 }
 
-/** Build package metadata from Riot's declarative and resolved package sets. */
-export function buildPackageMetadata(venv: RtVenv): RiotPackageMetadata[] {
-  const direct = normalizedEntries(venv.pkgs);
-  const resolved = normalizedEntries(venv.resolved_pkgs);
+/** Build package metadata from suitespec declarations and the resolved lock. */
+export function buildPackageMetadata(
+  environment: RtTestEnvironment,
+  suiteId?: string,
+): SuitePackageMetadata[] {
+  const direct = new Map(
+    environment.direct_dependencies.map((requirement) => [
+      requirementName(requirement),
+      requirement,
+    ]),
+  );
+  const resolved = normalizedEntries(environment.resolved_pkgs);
   const names = new Map<string, string>();
 
-  for (const name of Object.keys(venv.display_pkgs)) {
+  for (const name of Object.keys(environment.display_pkgs)) {
     names.set(normalizePackageName(name), name);
   }
-  for (const name of Object.keys(venv.pkgs)) {
-    names.set(normalizePackageName(name), name);
+  for (const requirement of environment.direct_dependencies) {
+    const name = requirementDisplayName(requirement);
+    names.set(requirementName(requirement), name);
   }
-  for (const name of Object.keys(venv.resolved_pkgs)) {
+  for (const name of Object.keys(environment.resolved_pkgs)) {
     const normalized = normalizePackageName(name);
     if (!names.has(normalized)) {
       names.set(normalized, name);
@@ -36,15 +45,21 @@ export function buildPackageMetadata(venv: RtVenv): RiotPackageMetadata[] {
     const version = resolved.get(normalized) || undefined;
     const isTransitive = declared === undefined;
     const tooltip = isTransitive
-      ? `Installed transitive dependency${version ? `: ${version}` : ""}`
-      : buildDirectTooltip(name, declared, version);
+      ? [
+          "Transitive dependency resolved from the suitespec lockfile",
+          `Installed: ${version ?? "not resolved"}`,
+          `Lockfile: ${environment.lockfile}`,
+        ].join("\n")
+      : buildDirectTooltip(declared, version, suiteId, environment.name);
 
     return { name, version, tooltip, isTransitive };
   });
 }
 
-export function getDirectPackageNames(venv: RtVenv): Set<string> {
-  return new Set(Object.keys(venv.pkgs).map(normalizePackageName));
+export function getDirectPackageNames(
+  environment: RtTestEnvironment,
+): Set<string> {
+  return new Set(environment.direct_dependencies.map(requirementName));
 }
 
 function normalizedEntries(
@@ -59,14 +74,23 @@ function normalizedEntries(
 }
 
 function buildDirectTooltip(
-  name: string,
-  constraint: string,
+  requirement: string,
   version: string | undefined,
+  suiteId: string | undefined,
+  environmentName: string,
 ): string {
-  const declared = constraint ? `${name}${constraint}` : `${name} (latest)`;
   return [
-    "Direct dependency declared by Riot",
-    `Declared: ${declared}`,
+    `Direct dependency declared by suitespec${suiteId ? ` for ${suiteId}/${environmentName}` : ""}`,
+    `Declared: ${requirement}`,
     `Installed: ${version ?? "not resolved"}`,
   ].join("\n");
+}
+
+function requirementName(requirement: string): string {
+  return normalizePackageName(requirementDisplayName(requirement));
+}
+
+function requirementDisplayName(requirement: string): string {
+  const match = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(requirement);
+  return match?.[1] ?? requirement.trim();
 }

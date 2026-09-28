@@ -1,254 +1,224 @@
 use std::{
     fs,
-    io::{self, IsTerminal, Write as _},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, OnceLock},
 };
 
+use indexmap::IndexMap;
+use rayon::current_num_threads;
+use serde::Serialize;
+
 use crate::{
     command::ManagedCommand,
-    config::Selector,
+    config::{RepoConfig, Selector},
+    constants::{RT_VERSION, RUNTIME_CONFIG},
     error::{RtError, RtResult},
     progress::{
         MultiplexedProgressLogger, PlainProgressLogger, ProgressLogger, StepContext, StepId, Task,
         TaskRunner, summarize_errors,
     },
     uv_project::{ensure_uv_project, has_pkg},
-    venv::{ExecutionContext, RiotVenv, venv_path},
-};
-use indexmap::IndexMap;
-use serde::Serialize;
-
-use rayon::current_num_threads;
-
-use crate::{
-    config::RepoConfig,
-    constants::{RT_VERSION, RUNTIME_CONFIG},
-    venv::select_execution_contexts,
+    venv::{
+        Suite, TestEnvironment, TestRun, environment_path, profile_fingerprint, profile_path,
+        select_test_environments,
+    },
 };
 
-/// Build the virtual environment for the provided execution context.
-///
-/// # Errors
-///
-/// Returns an error when context selection fails or any build step fails.
 pub fn run(
-    venvs: IndexMap<String, RiotVenv>,
+    suites: &IndexMap<String, Suite>,
     repo: &RepoConfig,
     selector: Selector,
     force_reinstall: bool,
     no_editable: bool,
 ) -> RtResult<()> {
-    let selected = select_execution_contexts(venvs, selector)?;
-    build_selected_contexts(repo, &selected, force_reinstall, no_editable)
+    let selected = select_test_environments(suites, selector)?;
+    build_selected_environments(repo, &selected, force_reinstall, no_editable)
 }
 
-#[must_use]
-pub fn collect_context_indices(selected: &[RiotVenv]) -> Vec<(usize, usize)> {
-    selected
-        .iter()
-        .enumerate()
-        .flat_map(|(venv_idx, selected_venv)| {
-            selected_venv
-                .execution_contexts
-                .iter()
-                .enumerate()
-                .map(move |(ctx_idx, _)| (venv_idx, ctx_idx))
-        })
-        .collect()
-}
-
-/// Build every selected execution context.
-///
-/// # Errors
-///
-/// Returns an error when the riot root cannot be prepared or any task fails.
-pub fn build_selected_contexts(
+pub fn build_selected_environments(
     repo: &RepoConfig,
-    selected: &[RiotVenv],
+    selected: &[TestEnvironment],
     force_reinstall: bool,
     no_editable: bool,
 ) -> RtResult<()> {
-    fs::create_dir_all(&repo.riot_root)
-        .map_err(|err| RtError::message(format!("error: could not create riot root: {err}")))?;
+    fs::create_dir_all(&repo.cache_root).map_err(|error| {
+        RtError::message(format!("error: could not create cache root: {error}"))
+    })?;
     let sink: Arc<dyn ProgressLogger> = if io::stderr().is_terminal() {
-        match MultiplexedProgressLogger::new() {
-            Ok(logger) => Arc::new(logger),
-            Err(_) => Arc::new(PlainProgressLogger::default()),
-        }
+        MultiplexedProgressLogger::new().map_or_else(
+            |_| Arc::new(PlainProgressLogger::default()) as Arc<_>,
+            |logger| Arc::new(logger) as Arc<_>,
+        )
     } else {
         Arc::new(PlainProgressLogger::default())
     };
-    let shared = Arc::new(BuildSharedState::new(
+    let state = Arc::new(BuildSharedState::new(
         force_reinstall,
         no_editable,
-        repo.riot_root.clone(),
-        repo.riotfile_path
-            .parent()
-            .ok_or_else(|| RtError::message("error: could not find riotfile parent"))?
-            .to_path_buf(),
+        repo.cache_root.clone(),
+        repo.project_root.clone(),
         crate::runtime_project_path()?,
     ));
     let runner = TaskRunner::new(Arc::clone(&sink)).with_parallelism(Some(current_num_threads()));
-
-    let context_indices = collect_context_indices(selected);
-
-    let exc_ctx_tasks: Vec<_> = context_indices
-        .iter()
-        .map(|&(venv_i, exc_i)| {
-            let state = Arc::clone(&shared);
-            let venv = &selected[venv_i];
-            let exc_ctx = &venv.execution_contexts[exc_i];
-            let step_id = format!("sync execution context {}", exc_ctx.hash);
-            Task::new(StepId::new(&step_id), &step_id, move |ctx| {
-                state.ensure_execution_ctx(venv, exc_ctx, &ctx)
+    let mut unique = IndexMap::new();
+    for environment in selected {
+        unique
+            .entry(environment.hash.clone())
+            .or_insert(environment);
+    }
+    let tasks: Vec<_> = unique
+        .into_values()
+        .map(|environment| {
+            let state = Arc::clone(&state);
+            let label = format!("sync test environment {}", environment.hash);
+            Task::new(StepId::new(&label), &label, move |context| {
+                state.ensure_environment(environment, &context)
             })
         })
         .collect();
-
-    let exc_errors = runner.run(exc_ctx_tasks).map_err(|err| {
+    let errors = runner.run(tasks).map_err(|error| {
         RtError::message(format!(
-            "error: could not configure build parallelism ({err})"
+            "error: could not configure build parallelism ({error})"
         ))
     })?;
-
-    if summarize_errors(&exc_errors, "build") {
+    if summarize_errors(&errors, "build") {
         return Err(RtError::silent(1));
     }
-
     Ok(())
 }
 
 struct BuildSharedState {
     force_reinstall: bool,
     no_editable: bool,
-    riot_root: PathBuf,
+    cache_root: PathBuf,
     project_root: PathBuf,
     runtime_project: PathBuf,
 }
 
 impl BuildSharedState {
-    #[must_use]
     const fn new(
         force_reinstall: bool,
         no_editable: bool,
-        riot_root: PathBuf,
+        cache_root: PathBuf,
         project_root: PathBuf,
         runtime_project: PathBuf,
     ) -> Self {
         Self {
             force_reinstall,
             no_editable,
-            riot_root,
+            cache_root,
             project_root,
             runtime_project,
         }
     }
 
-    fn ensure_execution_ctx(
+    fn ensure_environment(
         &self,
-        venv: &RiotVenv,
-        exc: &ExecutionContext,
-        ctx: &StepContext,
+        environment: &TestEnvironment,
+        context: &StepContext,
     ) -> RtResult<()> {
-        let exc_venv_path = venv_path(&self.riot_root, &exc.hash);
-        if self.force_reinstall && exc_venv_path.exists() {
-            fs::remove_dir_all(&exc_venv_path)?;
+        let physical = environment_path(&self.cache_root, &environment.hash);
+        if self.force_reinstall && physical.exists() {
+            fs::remove_dir_all(&physical)?;
         }
-
         let uv_project = ensure_uv_project(
-            &self.riot_root,
+            &self.cache_root,
             &self.project_root,
             &self.runtime_project,
-            venv,
-            exc,
+            environment,
+            self.no_editable,
         )?;
-
-        let mut cmd = ManagedCommand::new_uv("sync", Arc::clone(&ctx.sink), ctx.step_id.clone());
-
-        // pylibmc has no wheels: it compiles against libmemcached, which the CI
-        // image installs system-wide (libmemcached-dev). On developer machines
-        // the headers usually live under a Homebrew prefix, so point the build
-        // at it.
-        if has_pkg(venv, "pylibmc")
+        let mut command =
+            ManagedCommand::new_uv("sync", Arc::clone(&context.sink), context.step_id.clone());
+        if has_pkg(environment, "pylibmc")
             && let Some(prefix) = libmemcached_prefix()
         {
-            cmd = cmd.env("LIBMEMCACHED", prefix);
+            command = command.env("LIBMEMCACHED", prefix);
         }
-
-        cmd = cmd
+        command = command
             .env("DD_FAST_BUILD", "1")
-            .env("UV_PROJECT_ENVIRONMENT", &exc_venv_path)
+            .env("UV_PROJECT_ENVIRONMENT", &physical)
             .arg("--project")
             .arg(&uv_project)
             .arg("--python")
-            .arg(&venv.python);
-
+            .arg(&environment.python);
         if self.force_reinstall {
-            cmd = cmd.arg("--reinstall");
+            command = command.arg("--reinstall");
         }
-
         if self.no_editable {
-            cmd = cmd.arg("--no-editable");
+            command = command.arg("--no-editable");
         } else {
-            cmd = cmd.args(["--config-setting", "editable_mode=compat"]);
+            command = command.args(["--config-setting", "editable_mode=compat"]);
         }
-
-        match fs::remove_file(exc_venv_path.join(RUNTIME_CONFIG)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-
-        let status = cmd.status()?;
-
+        let status = command.status()?;
         if !status.success() {
             return Err(RtError::message(format!(
                 "error: uv sync failed with status {status}"
             )));
         }
-
-        self.write_runtime_context(venv, exc, &exc_venv_path)?;
-
+        for run in &environment.runs {
+            self.write_profile(environment, run, &physical)?;
+        }
         Ok(())
     }
 
-    fn write_runtime_context(
+    fn write_profile(
         &self,
-        venv: &RiotVenv,
-        exc: &ExecutionContext,
-        environment_path: &Path,
+        environment: &TestEnvironment,
+        run: &TestRun,
+        physical: &Path,
     ) -> RtResult<()> {
-        let mut environment = venv.suite_env.clone();
-
-        // Values from riotfile.py override inherited suitespec values.
-        environment.extend(exc.env.clone());
-
+        let profile = profile_path(&self.cache_root, &environment.hash, run.index);
+        let bin = profile.join("bin");
+        fs::create_dir_all(&bin)?;
+        let mut values = environment.suite_env.clone();
+        values.extend(run.env.clone());
+        values.insert(
+            "TEST_SUITE".to_owned(),
+            environment.integration_name.clone(),
+        );
         let project_root = fs::canonicalize(&self.project_root)
             .unwrap_or_else(|_| self.project_root.clone())
             .to_string_lossy()
             .into_owned();
         let manifest = RuntimeContextManifest {
             rt_version: RT_VERSION,
+            profile_fingerprint: profile_fingerprint(environment, run, self.no_editable),
             project_root: &project_root,
             no_editable: self.no_editable,
-            environment,
-            services: &venv.services,
-            command: exc.command.as_deref(),
+            environment: values,
+            services: &environment.services,
+            command: &run.command,
         };
-        let mut manifest = serde_json::to_string_pretty(&manifest).map_err(|err| {
-            RtError::message(format!("error: failed to serialize runtime context: {err}"))
-        })?;
-        manifest.push('\n');
-
-        let mut temporary = tempfile::NamedTempFile::new_in(environment_path)?;
-        temporary.write_all(manifest.as_bytes())?;
-        temporary.flush()?;
-        temporary
-            .persist(environment_path.join(RUNTIME_CONFIG))
-            .map_err(|err| err.error)?;
-
+        atomic_write_json(&profile.join(RUNTIME_CONFIG), &manifest)?;
+        let manifest_path = fs::canonicalize(profile.join(RUNTIME_CONFIG))
+            .unwrap_or_else(|_| profile.join(RUNTIME_CONFIG));
+        let physical_python = physical.join(if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        });
+        #[cfg(unix)]
+        {
+            write_executable(
+                &bin.join("python"),
+                &format!(
+                    "#!/bin/sh\nexport RT_CONTEXT_PATH={}\nexec {} \"$@\"\n",
+                    shell_quote(&manifest_path),
+                    shell_quote(&physical_python)
+                ),
+            )?;
+            write_executable(
+                &bin.join("activate"),
+                &format!(
+                    "export RT_CONTEXT_PATH={}\n. {}\n",
+                    shell_quote(&manifest_path),
+                    shell_quote(&physical.join("bin/activate"))
+                ),
+            )?;
+        }
         Ok(())
     }
 }
@@ -256,20 +226,44 @@ impl BuildSharedState {
 #[derive(Serialize)]
 struct RuntimeContextManifest<'a> {
     rt_version: &'static str,
+    profile_fingerprint: String,
     project_root: &'a str,
     no_editable: bool,
     environment: IndexMap<String, String>,
     services: &'a [String],
-    command: Option<&'a str>,
+    command: &'a str,
 }
 
-/// Locate a libmemcached installation for building `pylibmc`.
-///
-/// Resolution order: an explicit `LIBMEMCACHED` in the environment, then
-/// `brew --prefix libmemcached`, then the well-known Homebrew prefixes.
+fn atomic_write_json(path: &Path, value: &impl Serialize) -> RtResult<()> {
+    let mut contents = serde_json::to_string_pretty(value).map_err(|error| {
+        RtError::message(format!(
+            "error: failed to serialize runtime profile: {error}"
+        ))
+    })?;
+    contents.push('\n');
+    let parent = path
+        .parent()
+        .ok_or_else(|| RtError::message("error: runtime profile has no parent"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents.as_bytes())?;
+    temporary.flush()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 fn libmemcached_prefix() -> Option<String> {
     static PREFIX: OnceLock<Option<String>> = OnceLock::new();
-
     PREFIX
         .get_or_init(|| {
             if let Some(prefix) = std::env::var_os("LIBMEMCACHED")
@@ -277,7 +271,6 @@ fn libmemcached_prefix() -> Option<String> {
             {
                 return Some(prefix.to_string_lossy().into_owned());
             }
-
             Command::new("brew")
                 .args(["--prefix", "libmemcached"])
                 .stderr(Stdio::null())
@@ -300,71 +293,7 @@ fn libmemcached_prefix() -> Option<String> {
                     .map(PathBuf::from),
                 )
                 .find(|candidate| candidate.join("include/libmemcached/memcached.h").is_file())
-                .map(|prefix| prefix.to_string_lossy().into_owned())
+                .map(|path| path.to_string_lossy().into_owned())
         })
         .clone()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::BuildSharedState;
-    use crate::constants::{RT_VERSION, RUNTIME_CONFIG};
-    use crate::venv::{ExecutionContext, RiotVenv};
-    use indexmap::IndexMap;
-    use std::fs;
-
-    #[test]
-    fn runtime_context_is_an_atomic_json_completion_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let project_root = dir.path().join("project");
-        let environment_path = dir.path().join("venv_context");
-        fs::create_dir_all(&project_root).unwrap();
-        fs::create_dir_all(&environment_path).unwrap();
-        let state = BuildSharedState::new(
-            false,
-            true,
-            dir.path().join(".riot"),
-            project_root.clone(),
-            dir.path().join("rt-runtime"),
-        );
-        let mut venv = RiotVenv::empty_for_tests();
-        venv.services = vec!["postgres".to_owned(), "testagent".to_owned()];
-        venv.suite_env
-            .insert("SHARED".to_owned(), "suite".to_owned());
-        venv.suite_env
-            .insert("SUITE_ONLY".to_owned(), "line\nvalue".to_owned());
-        let exc = ExecutionContext {
-            command: Some("pytest tests/example.py".to_owned()),
-            pytest_targets: Vec::new(),
-            env: IndexMap::from([
-                ("SHARED".to_owned(), "riotfile".to_owned()),
-                ("RIOT_ONLY".to_owned(), "quoted \"value\"".to_owned()),
-            ]),
-            create: true,
-            skip_dev_install: true,
-            hash: "context".to_owned(),
-        };
-
-        state
-            .write_runtime_context(&venv, &exc, &environment_path)
-            .unwrap();
-
-        let manifest: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(environment_path.join(RUNTIME_CONFIG)).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(manifest["rt_version"], RT_VERSION);
-        assert_eq!(
-            manifest["project_root"].as_str(),
-            project_root.canonicalize().unwrap().to_str()
-        );
-        assert_eq!(manifest["no_editable"].as_bool(), Some(true));
-        assert_eq!(manifest["environment"]["SHARED"], "riotfile");
-        assert_eq!(manifest["environment"]["SUITE_ONLY"], "line\nvalue");
-        assert_eq!(manifest["environment"]["RIOT_ONLY"], "quoted \"value\"");
-        assert_eq!(manifest["services"][0], "postgres");
-        assert_eq!(manifest["services"][1], "testagent");
-        assert_eq!(manifest["command"], "pytest tests/example.py");
-        assert_eq!(fs::read_dir(&environment_path).unwrap().count(), 1);
-    }
 }

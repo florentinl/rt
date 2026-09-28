@@ -15,7 +15,7 @@ mod constants;
 mod display;
 mod error;
 mod progress;
-mod riot_config;
+mod suitespec;
 mod ui;
 mod uv_project;
 mod venv;
@@ -23,12 +23,13 @@ mod venv;
 use crate::{
     config::{RepoConfig, Selector},
     error::{RtError, RtResult},
-    venv::RiotVenv,
+    venv::Suite,
 };
 use clap::{Subcommand, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use indexmap::IndexMap;
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -73,33 +74,34 @@ fn cli_main(args: Vec<String>) -> u8 {
     about = "CLI proxy exported from the rt native extension."
 )]
 struct Cli {
-    /// Path to the riotfile to use. Falls back to discovery if omitted.
-    #[arg(short, long, value_name = "PATH", add = ValueHint::FilePath)]
-    pub file: Option<PathBuf>,
+    /// Project root containing tests/suitespec.py. Falls back to discovery.
     #[arg(short, long, value_name = "PATH", add = ValueHint::DirPath)]
-    pub riot_root: Option<PathBuf>,
+    pub project_root: Option<PathBuf>,
+    /// Cache root. Defaults to <project>/.cache/rt.
+    #[arg(long, value_name = "PATH", add = ValueHint::DirPath)]
+    pub cache_root: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List fully specified virtual environments with inherited configuration.
+    /// List normalized suites, test environments, and runs.
     #[command(alias = "ls")]
     List {
-        /// Print only the unique hashes of the normalized virtual environments.
+        /// Print only unique test-environment hashes.
         #[arg(long = "hash-only")]
         hash_only: bool,
-        /// Output the selected environments as JSON instead of a hierarchy.
+        /// Output the suite-first schema as JSON instead of a hierarchy.
         #[arg(long = "json")]
         json: bool,
-        /// Optional regular expression to match venv names.
+        /// Optional suite ID, environment hash, run ID, or name regular expression.
         #[arg(
             value_name = "NAME_PATTERN",
             add = ArgValueCompleter::new(completion::NameCompleter)
         )]
         pattern: Option<String>,
-        /// Filter venvs to specific Python versions.
+        /// Filter test environments to specific Python versions.
         #[arg(
             short = 'p',
             long = "python",
@@ -107,20 +109,20 @@ enum Commands {
             add = ArgValueCompleter::new(completion::PythonCompleter)
         )]
         python: Option<Vec<String>>,
-        /// Filter to execution contexts whose pytest target prefix-matches this path.
+        /// Filter to suites whose patterns include this path and do not exclude it.
         #[arg(short = 't', long = "test", value_name = "PYTEST_TARGET")]
         test: Option<String>,
     },
-    /// Show the normalized configuration for a venv or execution context.
+    /// Show a normalized test environment or run.
     Describe {
-        /// Execution or venv hash.
+        /// Test-environment hash or run ID.
         #[arg(
             value_name = "HASH",
             add = ArgValueCompleter::new(completion::HashCompleter)
         )]
         hash: String,
     },
-    /// Build the virtual environment for execution contexts matched by the selector.
+    /// Build test environments matched by the selector.
     Build {
         /// Force reinstalling cached dependencies before building.
         #[arg(long = "force-reinstall")]
@@ -128,7 +130,7 @@ enum Commands {
         /// Install the project in non-editable mode (copies built package instead of linking to source).
         #[arg(long = "no-editable")]
         no_editable: bool,
-        /// Filter venvs to specific Python versions.
+        /// Filter test environments to specific Python versions.
         #[arg(
             short = 'p',
             long = "python",
@@ -136,18 +138,18 @@ enum Commands {
             add = ArgValueCompleter::new(completion::PythonCompleter)
         )]
         python: Option<Vec<String>>,
-        /// Selector interpreted as execution context hash, venv hash, or name regex (in that order).
+        /// Suite ID, environment hash, run ID, or environment-name regex.
         #[arg(
             value_name = "PATTERN",
             required = true,
             add = ArgValueCompleter::new(completion::SelectorCompleter)
         )]
         pattern: Option<String>,
-        /// Filter to execution contexts whose pytest target prefix-matches this path.
+        /// Filter to suites whose patterns include this path and do not exclude it.
         #[arg(short = 't', long = "test", value_name = "PYTEST_TARGET")]
         test: Option<String>,
     },
-    /// Build and execute the command for execution contexts matched by the selector.
+    /// Build and execute test runs matched by the selector.
     Run {
         /// Force reinstalling cached dependencies before running.
         #[arg(long = "force-reinstall")]
@@ -163,10 +165,10 @@ enum Commands {
             default_missing_value = "10"
         )]
         parallel: Option<usize>,
-        /// Override the execution context command template.
+        /// Override the suitespec run command template.
         #[arg(long = "command", value_name = "COMMAND")]
         command_override: Option<String>,
-        /// Filter venvs to specific Python versions.
+        /// Filter test environments to specific Python versions.
         #[arg(
             short = 'p',
             long = "python",
@@ -174,23 +176,23 @@ enum Commands {
             add = ArgValueCompleter::new(completion::PythonCompleter)
         )]
         python: Option<Vec<String>>,
-        /// Selector interpreted as execution context hash, venv hash, or name regex (in that order).
+        /// Suite ID, environment hash, run ID, or environment-name regex.
         #[arg(
             value_name = "PATTERN",
             required = true,
             add = ArgValueCompleter::new(completion::SelectorCompleter)
         )]
         pattern: String,
-        /// Filter to execution contexts whose pytest target prefix-matches this path.
+        /// Filter to suites whose patterns include this path and do not exclude it.
         #[arg(short = 't', long = "test", value_name = "PYTEST_TARGET")]
         test: Option<String>,
-        /// Arguments forwarded to the execution context command after `--`.
+        /// Arguments substituted for `{cmdargs}` in the suitespec command.
         #[arg(value_name = "CMDARGS", trailing_var_arg = true)]
         cmdargs: Vec<String>,
     },
-    /// Build the virtual environment and start a shell with it activated.
+    /// Build a test run profile and start a shell with it active.
     Shell {
-        /// Execution or venv hash.
+        /// Test-environment hash or run ID.
         #[arg(
             value_name = "HASH",
             add = ArgValueCompleter::new(completion::HashCompleter)
@@ -200,9 +202,9 @@ enum Commands {
         #[arg(long = "force-reinstall")]
         force_reinstall: bool,
     },
-    /// Build the virtual environment and print the activation script path.
+    /// Build a test run profile and print its activation script path.
     Activate {
-        /// Execution or venv hash.
+        /// Test-environment hash or run ID.
         #[arg(
             value_name = "HASH",
             add = ArgValueCompleter::new(completion::HashCompleter)
@@ -212,9 +214,9 @@ enum Commands {
         #[arg(long = "force-reinstall")]
         force_reinstall: bool,
     },
-    /// Build the virtual environment and link it as .venv in the riotfile directory.
+    /// Build the test profile and link it as .venv in the project root.
     Switch {
-        /// Execution or venv hash.
+        /// Test-environment hash or run ID.
         #[arg(
             value_name = "HASH",
             add = ArgValueCompleter::new(completion::HashCompleter)
@@ -224,12 +226,14 @@ enum Commands {
         #[arg(long = "force-reinstall")]
         force_reinstall: bool,
     },
-    /// Remove all cached virtual environments while keeping compiled requirements.
+    /// Remove the rt cache for this project.
     Clean,
     #[command(name = "_is_venv_ready", hide = true)]
     IsVenvReady {
         #[arg(value_name = "HASH")]
         hash: String,
+        #[arg(long, value_name = "FINGERPRINT")]
+        profile_fingerprint: Option<String>,
     },
 }
 
@@ -238,11 +242,7 @@ enum Commands {
 /// # Errors
 ///
 /// Returns an error if command execution fails.
-fn run_command(
-    riot_venvs: IndexMap<String, RiotVenv>,
-    cli: Cli,
-    repo: &RepoConfig,
-) -> RtResult<()> {
+fn run_command(suites: IndexMap<String, Suite>, cli: Cli, repo: &RepoConfig) -> RtResult<()> {
     match cli.command {
         Commands::List {
             hash_only,
@@ -262,9 +262,9 @@ fn run_command(
                 pattern,
                 test,
             };
-            commands::list::run(riot_venvs, repo, selector, hash_only, json)
+            commands::list::run(suites, repo, selector, hash_only, json)
         }
-        Commands::Describe { hash } => commands::describe::run(riot_venvs, repo, hash),
+        Commands::Describe { hash } => commands::describe::run(&suites, repo, hash),
         Commands::Build {
             force_reinstall,
             no_editable,
@@ -272,7 +272,7 @@ fn run_command(
             python,
             test,
         } => commands::build::run(
-            riot_venvs,
+            &suites,
             repo,
             Selector::Generic {
                 python,
@@ -292,7 +292,7 @@ fn run_command(
             test,
             cmdargs,
         } => commands::run::run(
-            riot_venvs,
+            &suites,
             repo,
             Selector::Generic {
                 python,
@@ -310,29 +310,37 @@ fn run_command(
         Commands::Shell {
             hash,
             force_reinstall,
-        } => commands::shell::run(riot_venvs, repo, &hash, force_reinstall),
+        } => commands::shell::run(&suites, repo, &hash, force_reinstall),
         Commands::Activate {
             hash,
             force_reinstall,
-        } => commands::activate::run(riot_venvs, repo, &hash, force_reinstall),
+        } => commands::activate::run(&suites, repo, &hash, force_reinstall),
         Commands::Switch {
             hash,
             force_reinstall,
-        } => commands::switch::run(riot_venvs, repo, &hash, force_reinstall),
-        Commands::Clean => commands::clean::run(&repo.riot_root),
-        Commands::IsVenvReady { hash } => commands::is_venv_ready::run(&repo.riot_root, &hash),
+        } => commands::switch::run(&suites, repo, &hash, force_reinstall),
+        Commands::Clean => commands::clean::run(&repo.cache_root),
+        Commands::IsVenvReady {
+            hash,
+            profile_fingerprint,
+        } => commands::is_venv_ready::run(&repo.cache_root, &hash, profile_fingerprint.as_deref()),
     }
 }
 
-fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> RtResult<PathBuf> {
-    if let Some(path) = riotfile_arg {
-        if !path.is_file() {
+fn locate_project_root(project_root: Option<&PathBuf>) -> RtResult<PathBuf> {
+    if let Some(path) = project_root {
+        if !path.join("tests/suitespec.py").is_file() {
             return Err(RtError::message(format!(
-                "error: specified riotfile {} does not exist.",
+                "error: specified project root {} does not contain tests/suitespec.py.",
                 path.display()
             )));
         }
-        return Ok(path.to_owned());
+        return fs::canonicalize(path).map_err(|err| {
+            RtError::message(format!(
+                "error: failed to resolve project root {}: {err}",
+                path.display()
+            ))
+        });
     }
 
     let mut dir = std::env::current_dir().map_err(|err| {
@@ -342,9 +350,8 @@ fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> RtResult<PathBuf> {
     })?;
 
     loop {
-        let candidate = dir.join("riotfile.py");
-        if candidate.is_file() {
-            return Ok(candidate);
+        if dir.join("tests/suitespec.py").is_file() {
+            return Ok(dir);
         }
 
         if dir.join(".git").is_dir() {
@@ -357,25 +364,25 @@ fn locate_riotfile(riotfile_arg: Option<&PathBuf>) -> RtResult<PathBuf> {
     }
 
     Err(RtError::message(
-        "error: riotfile.py not found in the current workspace (searched up to the git repository root).",
+        "error: tests/suitespec.py not found in the current workspace (searched up to the git repository root).",
     ))
 }
 
-fn locate_riotroot(riotfile_path: &Path, riot_root_path: Option<&PathBuf>) -> RtResult<PathBuf> {
-    let path = riot_root_path.map_or_else(
-        || {
-            riotfile_path
-                .parent()
-                .and_then(|parent| parent.exists().then_some(parent.join(".riot")))
-        },
+fn locate_cache_root(project_root: &Path, cache_root: Option<&PathBuf>) -> RtResult<PathBuf> {
+    let path = cache_root.map_or_else(
+        || project_root.join(".cache/rt"),
         |path| {
-            path.parent()
-                .is_some_and(Path::exists)
-                .then_some(path.clone())
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir().map_or_else(|_| path.clone(), |current| current.join(path))
+            }
         },
     );
-
-    path.ok_or_else(|| RtError::message("error: could not create riot root directory"))
+    path.parent()
+        .is_some_and(Path::exists)
+        .then_some(path)
+        .ok_or_else(|| RtError::message("error: cache root parent does not exist"))
 }
 
 fn runtime_project_path() -> RtResult<PathBuf> {
@@ -388,26 +395,29 @@ fn runtime_project_path() -> RtResult<PathBuf> {
 fn try_main(args: Vec<String>) -> RtResult<()> {
     let cli = Cli::parse_from(args);
 
-    let riotfile_path = locate_riotfile(cli.file.as_ref())?;
-    let riot_root = locate_riotroot(&riotfile_path, cli.riot_root.as_ref())?;
+    let project_root = locate_project_root(cli.project_root.as_ref())?;
+    let cache_root = locate_cache_root(&project_root, cli.cache_root.as_ref())?;
 
     // Cache maintenance and readiness checks only need the cache root. In
     // particular, they must remain usable when the project's Python
     // configuration is temporarily broken.
     match &cli.command {
-        Commands::Clean => return commands::clean::run(&riot_root),
-        Commands::IsVenvReady { hash } => {
-            return commands::is_venv_ready::run(&riot_root, hash);
+        Commands::Clean => return commands::clean::run(&cache_root),
+        Commands::IsVenvReady {
+            hash,
+            profile_fingerprint,
+        } => {
+            return commands::is_venv_ready::run(&cache_root, hash, profile_fingerprint.as_deref());
         }
         _ => {}
     }
 
-    let riot_venvs = venv::load_context(&riotfile_path, Some(&riot_root))?;
+    let suites = venv::load_context(&project_root, Some(&cache_root))?;
 
     let repo_config = RepoConfig {
-        riotfile_path,
-        riot_root,
+        project_root,
+        cache_root,
     };
 
-    run_command(riot_venvs, cli, &repo_config)
+    run_command(suites, cli, &repo_config)
 }

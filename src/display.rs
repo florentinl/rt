@@ -661,11 +661,9 @@ impl DisplayManager {
 
         let lines_for_failed = failed_count * FAILED_BLOCK_LINES;
         let remaining_lines = available_height.saturating_sub(lines_for_failed);
-        if running_count > 0 {
-            (remaining_lines / running_count).max(RUNNING_MIN_LINES)
-        } else {
-            0
-        }
+        remaining_lines
+            .checked_div(running_count)
+            .map_or(0, |lines| lines.max(RUNNING_MIN_LINES))
     }
 
     fn format_duration(duration: Duration) -> String {

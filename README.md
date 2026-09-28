@@ -1,101 +1,130 @@
-# Riot Python Environments
+# rt Suite Environments
 
-A VS Code extension that brings [riot](https://github.com/DataDog/riot) virtual environments into the [Python Environments](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-python-envs) UI. Select a riot environment, run tests from the sidebar, get per-file code lenses, and let the extension handle service containers for you.
+`rt` makes the test suites declared by dd-trace-py's suitespec available from
+the command line and from VS Code's
+[Python Environments](https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-python-envs)
+UI. Suitespec remains the source of truth for suite names, file patterns,
+Python and dependency matrices, run commands, environment variables, and
+services. `rt` discovers that normalized model and materializes it with `uv`.
 
+The VS Code extension keeps Microsoft's normal pytest collection, run, debug,
+and result flow. It contributes environments and pytest configuration; it does
+not implement another test adapter.
 
+## Install the extension
 
-https://github.com/user-attachments/assets/b3920bbc-c7b5-4c14-8fdc-4f067fcdd777
-
-
-
-## Getting Started
-
-### Install the Extension
-
-Download the latest `.vsix` from the [GitHub Releases](https://github.com/florentinl/rt/releases) page, then install it:
+Download the latest `.vsix` from the
+[GitHub Releases](https://github.com/florentinl/rt/releases) page, then install
+it:
 
 ```bash
 code --install-extension riot-python-environments-*.vsix
 ```
 
-Or through the UI: Extensions panel → `...` menu → **Install from VSIX**.
-
-Then enable the Python Environments extension in your settings:
+Or use **Extensions → ... → Install from VSIX**. Enable the Python
+Environments extension in your settings:
 
 ```json
 "python.useEnvironmentsExtension": true
 ```
 
-The extension activates automatically when a `riotfile.py` is detected in your workspace.
+The extension activates for a dd-trace-py checkout containing suitespec files
+and `scripts/run-tests`. The VSIX includes the `rt` binary; a separate CLI
+installation is not required.
 
-The VSIX ships with its own bundled `rt` runtime, so no separate install is needed to use the extension.
+The published extension ID and VSIX filename retain
+`florentinl.riot-python-environments` so existing installations and keybindings
+upgrade in place. Riot is not used at runtime; all displayed names and behavior
+are suitespec-native.
 
-### (Optional) Install the CLI
+## Install the CLI
 
-If you also want to run `rt` from your terminal, install it with your preferred tool manager:
+To use `rt` from a terminal:
 
 ```bash
-# uv (recommended)
 uv tool install "git+ssh://git@github.com/florentinl/rt.git"
-
-# pipx
-pipx install "git+ssh://git@github.com/florentinl/rt.git"
-```
-
-Verify it works:
-
-```bash
 rt --help
 ```
 
-## Features
+## Suites, environments, and runs
 
-### Environment Picker
+The model exposed by both the CLI and VS Code is:
 
-Select any riot environment through `Python: Set Project Environment`. The extension discovers every venv defined in your riotfile, builds it on demand, and wires it into VS Code as the active interpreter.
+```text
+Suite                         file patterns, services, suite environment
+└── TestEnvironment           Python, dependencies, lockfile, shared venv
+    └── TestRun               command and run-specific environment
+```
 
-### Test UI Integration
+VS Code groups entries by suite. Each concrete `TestEnvironment` owns one
+physical environment under `.cache/rt/environments/<hash>`. Its runs reuse that
+environment through small launch profiles under
+`.cache/rt/profiles/<hash>/<run>/`; the launchers select an immutable external
+context with `RT_CONTEXT_PATH`. Selecting one run therefore cannot overwrite
+the context used by another run.
 
-When you select an environment, the extension configures `python.testing.pytestArgs` automatically so the VS Code test sidebar picks up the right pytest target. Run, debug, and re-run tests without leaving the editor.
+Use `--cache-root PATH` before the subcommand to override `.cache/rt`.
 
-### Code Lenses
+Although Riot is no longer used, dd-trace-py currently commits generated
+lockfiles under `.riot/requirements`. `rt` reads that upstream-owned legacy
+path; it does not use `.riot` as its environment cache or configuration source.
 
-Test files (`tests/**/test_*.py`) get a clickable code lens allowing to select the riot environments that apply. Click it to quick-pick an environment scoped to that file.
+## CLI workflow
 
-### Package Visibility
+List suites and their concrete environments before running a focused subset:
 
-The Python Environments view shows the installed version of every package in a
-Riot environment. Packages declared in `riotfile.py` are shown as direct
-dependencies, while packages coming from the resolved lockfile are marked as
-transitive. Riot environments remain read-only in VS Code: edit `riotfile.py`
-and refresh or rebuild instead of installing or removing packages in place.
+```bash
+rt list
+rt list flask -p 3.12
+rt describe <environment-or-run-id>
+rt build flask -p 3.12
+rt run flask -p 3.12 -- -vv -k test_request
+```
 
-### Managed Runtime
+Selectors accept a suite-name pattern, an environment ID, or a run ID.
+Arguments after `--` are inserted into the suitespec run command at
+`{cmdargs}`. `rt build` and `rt run` materialize environments on demand; use
+`--force-reinstall` when a native or dependency change requires a clean build.
 
-Every generated environment includes the bundled `rt-runtime` package. It owns
-the Python startup hook, pytest integration, and typing stubs; uv builds it once
-and reuses the cached wheel across compatible environments. The only context
-file written by rt is `<venv>/rt_config.json`, which also records the rt version
-used to complete the environment.
+## VS Code behavior
 
-### Typed `envier` Settings
+### Environment picker and Test Explorer
 
-`envier` ships no `py.typed` marker, so every setting declared through it shows
-up as untyped in the editor. The `rt-runtime` package installs a vendored
-`types-envier` stub package in every managed environment - class access resolves
-to `EnvVariable[T]`, instance access to `T`. See
-`rt/_runtime_project/vendor/types-envier/VENDORING.md`.
+Choose an entry through **Python: Set Project Environment**. The extension
+builds a missing environment on selection and points the Python extension at
+the selected run's launcher. It also configures `python.testing.pytestArgs`
+from suitespec, so collection, individual test runs, and debugging continue to
+use the standard Python Test Explorer.
 
-### Service Containers
+### Suite code lenses
 
-Environments that declare services in `tests/suitespec.py` (including the `testagent` snapshot service) are wired up automatically. The extension injects a pytest plugin that starts and stops the right containers around your test run.
+Test files receive a code lens listing suites whose expanded suitespec patterns
+match that file. The quick pick is grouped by suite, then environment and run;
+it does not infer ownership by parsing a pytest command.
+
+### Package visibility
+
+The Python Environments view shows packages resolved for the selected
+`TestEnvironment`. Dependencies declared by suitespec are marked direct;
+packages coming only from the committed lockfile are marked transitive. Suite
+environments are immutable from VS Code: update the relevant `suitespec.yml`
+and its lockfile, then refresh or rebuild.
+
+### Managed runtime and services
+
+Every physical environment includes `rt-runtime`, which installs the startup
+hook, pytest integration, and vendored `envier` typing stubs. For real pytest
+sessions the runtime starts services declared by suitespec, discovers the
+published testagent port, and stops those services at session end. Collection
+only does not start containers, and xdist workers do not duplicate lifecycle
+ownership.
 
 ## Commands
 
-Open the Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) and type **Riot** to see:
+Open the Command Palette and type **rt**:
 
 | Command | Description |
 |---|---|
-| **Riot: Force Reinstall Selected Environment** | Tears down and rebuilds the currently selected environment from scratch. Useful after changing native dependencies or when the venv is in a bad state. |
-| **Riot: Refresh Riot Venv Indicators** | Refreshes the Riot environment index used by code lenses. Run this after editing `riotfile.py`. |
-| **Riot: Select Riot Environment for Current File** | Shows a quick-pick of environments whose pytest target matches the file you have open. |
+| **rt: Force Reinstall Selected Environment** | Rebuild the selected shared environment and its run profile. |
+| **rt: Refresh Suite Indicators** | Refresh suitespec-backed environments and code lenses. |
+| **rt: Select Suite Environment for Current File** | Select among suite runs whose expanded patterns match the active file. |
